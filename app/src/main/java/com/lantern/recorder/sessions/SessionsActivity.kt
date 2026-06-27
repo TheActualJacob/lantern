@@ -4,41 +4,102 @@ import android.content.Intent
 import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.appcompat.app.AppCompatActivity
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.FileProvider
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.lantern.recorder.R
+import com.lantern.recorder.recon.ModelStats
+import com.lantern.recorder.recon.ModelViewerScreen
+import com.lantern.recorder.recon.SessionDetailScreen
 import com.lantern.recorder.ui.theme.LanternTheme
 
 /**
- * Browser for recorded capture sessions (roadmap P6 UX layer). Lets the user see
- * what they've captured and act on it: **share** a session as a `.zip` (via
- * FileProvider) or **delete** it (button or swipe).
- *
- * The UI is Jetpack Compose ([SessionsScreen]); this activity owns the file-system
- * side effects and feeds an observable list from [SessionStore], refreshing on resume
- * so deletions and new recordings are always reflected.
+ * Browser for recorded capture sessions. Hosts a small in-activity navigation stack
+ * (list → session detail → 3D model viewer) using Compose state — no navigation
+ * library — so it stays dependency-light. Owns the file-system side effects (share
+ * zip via FileProvider, delete) and feeds an observable list from [SessionStore].
  */
 class SessionsActivity : AppCompatActivity() {
 
+    /** In-activity navigation target. */
+    private sealed interface Screen {
+        data object List : Screen
+        data class Detail(val session: SessionInfo) : Screen
+        data class Viewer(val session: SessionInfo, val stats: ModelStats) : Screen
+    }
+
     private var sessions by mutableStateOf<List<SessionInfo>>(emptyList())
+    private var screen by mutableStateOf<Screen>(Screen.List)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
             LanternTheme {
-                SessionsScreen(
-                    sessions = sessions,
-                    onBack = { finish() },
-                    onShare = ::shareSession,
-                    onDelete = ::confirmDelete,
-                )
+                // System / predictive back pops the in-activity stack before finishing.
+                BackHandler(enabled = screen !is Screen.List) {
+                    screen = when (val s = screen) {
+                        is Screen.Viewer -> Screen.Detail(s.session)
+                        else -> Screen.List
+                    }
+                }
+                AnimatedContent(
+                    targetState = screen,
+                    transitionSpec = {
+                        val forward = targetState !is Screen.List
+                        if (forward) {
+                            (slideInHorizontally(tween(260)) { it / 3 } + fadeIn(tween(260))) togetherWith
+                                fadeOut(tween(180))
+                        } else {
+                            fadeIn(tween(220)) togetherWith
+                                (slideOutHorizontally(tween(220)) { it / 3 } + fadeOut(tween(180)))
+                        }
+                    },
+                    label = "sessions-nav",
+                ) { target ->
+                    when (target) {
+                        is Screen.List -> SessionsScreen(
+                            sessions = sessions,
+                            onBack = { finish() },
+                            onOpen = { screen = Screen.Detail(it) },
+                            onShare = ::shareSession,
+                            onDelete = ::confirmDelete,
+                        )
+                        is Screen.Detail -> SessionDetailScreen(
+                            session = target.session,
+                            onBack = { screen = Screen.List },
+                            onOpenViewer = { stats ->
+                                screen = Screen.Viewer(target.session, stats)
+                            },
+                            onShare = { shareSession(target.session) },
+                        )
+                        is Screen.Viewer -> ModelViewerScreen(
+                            session = target.session,
+                            stats = target.stats,
+                            onBack = { screen = Screen.Detail(target.session) },
+                            onExport = {
+                                Toast.makeText(
+                                    this@SessionsActivity,
+                                    getString(R.string.export_unavailable),
+                                    Toast.LENGTH_SHORT,
+                                ).show()
+                            },
+                        )
+                    }
+                }
             }
         }
     }

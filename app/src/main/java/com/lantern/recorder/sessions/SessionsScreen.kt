@@ -57,6 +57,7 @@ import com.lantern.recorder.ui.theme.RecordRed
 fun SessionsScreen(
     sessions: List<SessionInfo>,
     onBack: () -> Unit,
+    onOpen: (SessionInfo) -> Unit,
     onShare: (SessionInfo) -> Unit,
     onDelete: (SessionInfo) -> Unit,
 ) {
@@ -94,6 +95,7 @@ fun SessionsScreen(
                 items(sessions, key = { it.name }) { session ->
                     SwipeableSessionRow(
                         session = session,
+                        onOpen = { onOpen(session) },
                         onShare = { onShare(session) },
                         onDelete = { onDelete(session) },
                         modifier = Modifier.animateItem(),
@@ -108,6 +110,7 @@ fun SessionsScreen(
 @Composable
 private fun SwipeableSessionRow(
     session: SessionInfo,
+    onOpen: () -> Unit,
     onShare: () -> Unit,
     onDelete: () -> Unit,
     modifier: Modifier = Modifier,
@@ -130,7 +133,7 @@ private fun SwipeableSessionRow(
         enableDismissFromStartToEnd = false,
         backgroundContent = { DeleteSwipeBackground() },
     ) {
-        SessionCard(session = session, onShare = onShare, onDelete = onDelete)
+        SessionCard(session = session, onOpen = onOpen, onShare = onShare, onDelete = onDelete)
     }
 }
 
@@ -153,13 +156,16 @@ private fun DeleteSwipeBackground() {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SessionCard(
     session: SessionInfo,
+    onOpen: () -> Unit,
     onShare: () -> Unit,
     onDelete: () -> Unit,
 ) {
     OutlinedCard(
+        onClick = onOpen,
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp, vertical = 6.dp),

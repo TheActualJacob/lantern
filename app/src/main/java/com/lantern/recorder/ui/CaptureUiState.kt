@@ -20,12 +20,12 @@ sealed interface CaptureStatus {
     /** Actively recording a session. */
     data class Recording(val session: String, val frames: Int) : CaptureStatus
 
-    /** A finished session summary, shown briefly after stopping. */
-    data class Saved(val frames: Int, val session: String) : CaptureStatus
-
     /** A diagnostic or error message (camera unavailable, waiting for tracking, …). */
     data class Message(val text: String, val isError: Boolean = false) : CaptureStatus
 }
+
+/** A just-finished session, surfaced as a transient confirmation card (not the chip). */
+data class SavedConfirmation(val session: String, val frames: Int)
 
 /**
  * Compose-observable UI state for the capture screen. Owned by `MainActivity`, which
@@ -45,6 +45,10 @@ class CaptureUiState {
         private set
 
     var frameCount by mutableIntStateOf(0)
+        private set
+
+    /** Set when a recording finishes; drives the transient save card, then cleared. */
+    var savedConfirmation by mutableStateOf<SavedConfirmation?>(null)
         private set
 
     fun onDepthResolved(supported: Boolean) {
@@ -69,7 +73,15 @@ class CaptureUiState {
     fun onRecordingStopped(session: String, frames: Int) {
         isRecording = false
         frameCount = frames
-        status = CaptureStatus.Saved(frames, session)
+        // Revert the chip to its idle depth state and surface a transient save card
+        // instead of letting a "Saved…" message linger in the chip.
+        status = CaptureStatus.DepthReady(depthSupported)
+        if (frames > 0) savedConfirmation = SavedConfirmation(session, frames)
+    }
+
+    /** Dismisses the transient save confirmation (after its timeout or on tap). */
+    fun clearSavedConfirmation() {
+        savedConfirmation = null
     }
 
     /** Surfaces a diagnostic/error message (only while it's meaningful to show one). */

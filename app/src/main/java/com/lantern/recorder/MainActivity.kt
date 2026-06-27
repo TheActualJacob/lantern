@@ -113,9 +113,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             val count = frameRecorder.savedFrameCount
             frameRecorder.stop()
             uiState.onRecordingStopped(name, count)
-            val summary = getString(R.string.recording_saved, count, name)
-            Toast.makeText(this, summary, Toast.LENGTH_LONG).show()
-            Log.i(TAG, "Saved to ${frameRecorder.sessionPath}")
+            Log.i(TAG, "Saved $count frames to ${frameRecorder.sessionPath}")
         } else {
             val name = frameRecorder.start()
             uiState.onRecordingStarted(name)

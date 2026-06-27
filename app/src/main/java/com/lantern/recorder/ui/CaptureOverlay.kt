@@ -13,6 +13,8 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
@@ -20,6 +22,7 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
@@ -28,6 +31,7 @@ import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -36,8 +40,10 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -60,6 +66,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.lantern.recorder.R
+import com.lantern.recorder.ui.theme.LanternNavy
 import com.lantern.recorder.ui.theme.RecordRed
 
 /**
@@ -115,6 +122,104 @@ fun CaptureOverlay(
                 .windowInsetsPadding(WindowInsets.navigationBars)
                 .padding(bottom = 32.dp),
         )
+
+        // Transient "saved" confirmation, floating just above the shutter. Far nicer
+        // than a system toast: on-brand, auto-dismissing, with a direct "View" action.
+        SaveConfirmation(
+            saved = state.savedConfirmation,
+            onView = {
+                state.clearSavedConfirmation()
+                onOpenSessions()
+            },
+            onDismiss = state::clearSavedConfirmation,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .windowInsetsPadding(WindowInsets.navigationBars)
+                .padding(bottom = 140.dp, start = 24.dp, end = 24.dp),
+        )
+    }
+}
+
+/**
+ * A floating confirmation card shown briefly after a recording stops. Slides up from
+ * behind the shutter with a green check, the frame count, and the session name, plus
+ * a "View" action. Auto-dismisses after a few seconds (or immediately when actioned).
+ */
+@Composable
+private fun SaveConfirmation(
+    saved: SavedConfirmation?,
+    onView: () -> Unit,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    // Drive auto-dismiss off the latest non-null value so the timer restarts per save.
+    LaunchedEffect(saved) {
+        if (saved != null) {
+            kotlinx.coroutines.delay(4500)
+            onDismiss()
+        }
+    }
+
+    AnimatedVisibility(
+        visible = saved != null,
+        enter = slideInVertically(tween(280)) { it / 2 } + fadeIn(tween(280)),
+        exit = slideOutVertically(tween(220)) { it / 2 } + fadeOut(tween(180)),
+        modifier = modifier,
+    ) {
+        // Keep the last value during the exit animation so it doesn't blank out.
+        val shown = remember(saved) { saved } ?: return@AnimatedVisibility
+        Surface(
+            color = LanternNavy.copy(alpha = 0.94f),
+            contentColor = Color.White,
+            shape = RoundedCornerShape(20.dp),
+            shadowElevation = 8.dp,
+            modifier = Modifier.widthIn(max = 420.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(start = 14.dp, end = 6.dp, top = 12.dp, bottom = 12.dp),
+            ) {
+                // Green check badge.
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(CircleShape)
+                        .drawBehind { drawCircle(Color(0xFF34C759)) },
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_check),
+                        contentDescription = null,
+                        tint = Color.White,
+                        modifier = Modifier.size(22.dp),
+                    )
+                }
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(horizontal = 12.dp),
+                ) {
+                    Text(
+                        text = stringResource(R.string.save_confirm_title, shown.frames),
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = shown.session,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.White.copy(alpha = 0.7f),
+                        maxLines = 1,
+                    )
+                }
+                TextButton(onClick = onView) {
+                    Text(
+                        text = stringResource(R.string.save_confirm_view),
+                        color = Color(0xFF8FC9FF),
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -310,13 +415,6 @@ private fun statusPresentation(status: CaptureStatus): Triple<String, Color, Boo
             stringResource(R.string.recording_status, status.session, status.frames),
             RecordRed,
             true,
-        )
-
-    is CaptureStatus.Saved ->
-        Triple(
-            stringResource(R.string.recording_saved, status.frames, status.session),
-            Color(0xFF6BE675),
-            false,
         )
 
     is CaptureStatus.Message ->

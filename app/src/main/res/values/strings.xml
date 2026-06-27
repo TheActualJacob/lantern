@@ -12,6 +12,8 @@
     <string name="recording_status">REC ● %1$s — %2$d frames</string>
     <string name="recording_saved">Saved %1$d frames → %2$s</string>
     <string name="depth_unsupported_no_record">Raw depth unsupported — recording disabled.</string>
+    <string name="save_confirm_title">%1$d frames saved</string>
+    <string name="save_confirm_view">View</string>
 
     <!-- Sessions browser (P6 UX). -->
     <string name="sessions_title">Sessions</string>
@@ -31,4 +33,32 @@
     <string name="delete_session_title">Delete session?</string>
     <string name="delete_session_message">%1$s will be permanently removed from this device.</string>
     <string name="delete_failed">Couldn\'t delete the session.</string>
+
+    <!-- Session detail + reconstruction (UI ahead of the on-device backend). -->
+    <string name="detail_title">Session</string>
+    <string name="build_model">Build 3D Model</string>
+    <string name="build_model_desc">Fuse the captured frames into a 3D mesh using the depth → metric-scale → TSDF pipeline, then clean it up for export.</string>
+    <string name="view_model">View 3D Model</string>
+    <string name="rebuild_model">Rebuild</string>
+    <string name="recon_running_title">Reconstructing…</string>
+    <string name="recon_done_title">Model ready</string>
+    <string name="recon_disclaimer">Preview only — on-device reconstruction isn\'t wired up yet. This runs a simulated pipeline so the flow can be designed ahead of the backend.</string>
+    <string name="stage_depth">Estimating depth · Depth Anything V2</string>
+    <string name="stage_scale">Calibrating metric scale</string>
+    <string name="stage_tsdf">Fusing depth · TSDF volume</string>
+    <string name="stage_mesh">Extracting mesh · marching cubes</string>
+    <string name="stage_cleanup">Cleanup &amp; export · .glb</string>
+
+    <!-- 3D model viewer. -->
+    <string name="model_viewer_title">3D Model</string>
+    <string name="model_stat_vertices">Vertices</string>
+    <string name="model_stat_faces">Faces</string>
+    <string name="model_stat_dimensions">Dimensions</string>
+    <string name="model_stat_size">Estimated size</string>
+    <string name="model_stat_watertight">Watertight</string>
+    <string name="model_export_glb">Export .glb</string>
+    <string name="model_preview_disclaimer">Wireframe placeholder — the real .glb viewer arrives with the reconstruction backend. Geometry and numbers are illustrative.</string>
+    <string name="export_unavailable">Export unlocks once reconstruction is wired up.</string>
+    <string name="value_yes">Yes</string>
+    <string name="value_no">No (remesh in cleanup)</string>
 </resources>
