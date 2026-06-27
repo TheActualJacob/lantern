@@ -118,6 +118,52 @@ def solve_affine_ransac(
     return float(best_params[0]), float(best_params[1])
 
 
+def solve_affine_sequence(
+    pred_disps: list[np.ndarray],
+    metric_depths: list[np.ndarray],
+    conf_masks: list[np.ndarray],
+    smooth_lambda: float = 0.05,
+) -> tuple[float, np.ndarray]:
+    """Jointly solve one global scale and one smooth shift per frame.
+
+    This is the host-side version of the S25-safe runtime rule: keep scale
+    stable across the scan and allow only slowly changing per-frame shifts.
+    """
+    if not (len(pred_disps) == len(metric_depths) == len(conf_masks)):
+        raise ValueError("pred_disps, metric_depths, and conf_masks must match lengths")
+    if not pred_disps:
+        raise ValueError("Need at least one frame to solve sequence affine fit")
+    if smooth_lambda < 0:
+        raise ValueError(f"smooth_lambda must be >= 0, got {smooth_lambda}")
+
+    samples = [
+        _valid_samples(pred_disp, metric_depth, conf_mask)
+        for pred_disp, metric_depth, conf_mask in zip(
+            pred_disps, metric_depths, conf_masks, strict=True
+        )
+    ]
+    per_frame_params = np.asarray([_linear_fit(x, y) for x, y in samples], dtype=np.float64)
+    initial_s = global_scale(per_frame_params[:, 0])
+    initial = np.concatenate(([initial_s], per_frame_params[:, 1]))
+    smooth_weight = float(np.sqrt(smooth_lambda))
+
+    def residual(params: np.ndarray) -> np.ndarray:
+        s = params[0]
+        shifts = params[1:]
+        data_residuals = [
+            s * x + shifts[idx] - y for idx, (x, y) in enumerate(samples)
+        ]
+        if shifts.size > 1 and smooth_weight > 0:
+            data_residuals.append(smooth_weight * np.diff(shifts))
+        return np.concatenate(data_residuals)
+
+    result = least_squares(residual, initial, loss="huber", f_scale=0.1)
+    if not result.success or not np.all(np.isfinite(result.x)):
+        return float(initial_s), smooth_shifts(per_frame_params[:, 1])
+
+    return float(result.x[0]), result.x[1:].astype(np.float64)
+
+
 def smooth_shifts(t_values: np.ndarray, window: int = 5) -> np.ndarray:
     """Temporally smooth per-frame shift values with a trailing moving average.
 
