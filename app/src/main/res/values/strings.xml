@@ -32,6 +32,8 @@
     <string name="coach_rule_light_desc">Bright, soft light reads best.</string>
     <string name="coach_rule_hands_title">Keep hands out of frame</string>
     <string name="coach_rule_hands_desc">Fingers in view may end up in the scan — table placement keeps them out.</string>
+    <string name="coach_rule_bottom_title">The resting face won\'t be scanned</string>
+    <string name="coach_rule_bottom_desc">Put the least-important side down — the bottom is filled in automatically during cleanup.</string>
     <string name="coach_dismiss">Got it</string>
     <string name="coach_help_cd">Scanning tips</string>
 

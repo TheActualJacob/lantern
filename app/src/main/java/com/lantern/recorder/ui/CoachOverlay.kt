@@ -58,6 +58,8 @@ private val coachRules = listOf(
     CoachRule(R.drawable.ic_cube, R.string.coach_rule_sides_title, R.string.coach_rule_sides_desc),
     CoachRule(R.drawable.ic_light, R.string.coach_rule_light_title, R.string.coach_rule_light_desc),
     CoachRule(R.drawable.ic_hand, R.string.coach_rule_hands_title, R.string.coach_rule_hands_desc),
+    // Sets expectations: the resting face is physically unscannable and filled in cleanup.
+    CoachRule(R.drawable.ic_surface, R.string.coach_rule_bottom_title, R.string.coach_rule_bottom_desc),
 )
 
 /**
