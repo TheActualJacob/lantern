@@ -2,10 +2,33 @@
     <string name="app_name">Lantern Recorder</string>
     <string name="status_initializing">Initializing AR session…</string>
     <string name="depth_supported">RAW_DEPTH_ONLY supported: %1$s</string>
+    <string name="status_depth_ready">Depth ready · tap to record</string>
+    <string name="status_depth_unsupported">Raw depth unsupported on this device</string>
     <string name="camera_permission_needed">Camera permission is required for AR capture.</string>
     <string name="record_start">● Record</string>
     <string name="record_stop">■ Stop</string>
+    <string name="a11y_start_recording">Start recording</string>
+    <string name="a11y_stop_recording">Stop recording</string>
     <string name="recording_status">REC ● %1$s — %2$d frames</string>
     <string name="recording_saved">Saved %1$d frames → %2$s</string>
     <string name="depth_unsupported_no_record">Raw depth unsupported — recording disabled.</string>
+
+    <!-- Sessions browser (P6 UX). -->
+    <string name="sessions_title">Sessions</string>
+    <string name="sessions_empty_title">No sessions yet</string>
+    <string name="sessions_empty_subtitle">Recorded captures will show up here.</string>
+    <plurals name="session_frames">
+        <item quantity="one">%1$d frame · %2$s</item>
+        <item quantity="other">%1$d frames · %2$s</item>
+    </plurals>
+    <string name="action_share">Share</string>
+    <string name="action_delete">Delete</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="action_back">Back</string>
+    <string name="preparing_share">Preparing zip…</string>
+    <string name="share_session_via">Share session via</string>
+    <string name="share_failed">Couldn\'t create the share archive.</string>
+    <string name="delete_session_title">Delete session?</string>
+    <string name="delete_session_message">%1$s will be permanently removed from this device.</string>
+    <string name="delete_failed">Couldn\'t delete the session.</string>
 </resources>

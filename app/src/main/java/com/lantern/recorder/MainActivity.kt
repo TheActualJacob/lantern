@@ -1,12 +1,20 @@
 package com.lantern.recorder
 
+import android.content.Intent
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.appcompat.app.AppCompatActivity
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.viewinterop.AndroidView
 import com.google.ar.core.ArCoreApk
+import com.google.ar.core.CameraConfig
+import com.google.ar.core.CameraConfigFilter
 import com.google.ar.core.Config
 import com.google.ar.core.Session
 import com.google.ar.core.exceptions.CameraNotAvailableException
@@ -15,28 +23,33 @@ import com.google.ar.core.exceptions.UnavailableArcoreNotInstalledException
 import com.google.ar.core.exceptions.UnavailableDeviceNotCompatibleException
 import com.google.ar.core.exceptions.UnavailableSdkTooOldException
 import com.google.ar.core.exceptions.UnavailableUserDeclinedInstallationException
-import com.lantern.recorder.databinding.ActivityMainBinding
 import com.lantern.recorder.recording.FrameRecorder
 import com.lantern.recorder.rendering.BackgroundRenderer
 import com.lantern.recorder.rendering.DisplayRotationHelper
+import com.lantern.recorder.sessions.SessionsActivity
+import com.lantern.recorder.ui.CaptureOverlay
+import com.lantern.recorder.ui.CaptureUiState
+import com.lantern.recorder.ui.theme.LanternTheme
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
 /**
- * Task P0b (first slice): bring up an ARCore session, render the live camera
- * feed, and confirm RAW_DEPTH_ONLY is supported on the device — logged under the
- * "LANTERN" tag and shown in the on-screen status overlay.
- *
- * Intentionally NOT here yet: recording, depth/pose readout, capture UI.
+ * Brings up an ARCore session, renders the live camera feed into a [GLSurfaceView],
+ * and drives recording via [FrameRecorder]. The capture controls (status chip,
+ * shutter, sessions FAB) are a Jetpack Compose overlay ([CaptureOverlay]) layered on
+ * top of the GL feed through [AndroidView] — the GL rendering + ARCore session
+ * lifecycle remain exactly as before.
  */
 class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
-    private lateinit var binding: ActivityMainBinding
     private lateinit var surfaceView: GLSurfaceView
     private lateinit var displayRotationHelper: DisplayRotationHelper
 
     private val backgroundRenderer = BackgroundRenderer()
     private lateinit var frameRecorder: FrameRecorder
+
+    /** Compose-observable mirror of capture state, updated on the UI thread. */
+    private val uiState = CaptureUiState()
 
     // Read on the GL thread, written on the UI thread.
     @Volatile
@@ -48,30 +61,46 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        binding = ActivityMainBinding.inflate(layoutInflater)
-        setContentView(binding.root)
+        enableEdgeToEdge()
 
-        surfaceView = binding.surfaceView
         displayRotationHelper = DisplayRotationHelper(this)
 
-        surfaceView.preserveEGLContextOnPause = true
-        surfaceView.setEGLContextClientVersion(2)
-        surfaceView.setEGLConfigChooser(8, 8, 8, 8, 16, 0)
-        surfaceView.setRenderer(this)
-        surfaceView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
-        surfaceView.setWillNotDraw(false)
+        // The camera feed MUST stay on a GLSurfaceView. We build it programmatically and
+        // embed it in Compose via AndroidView; ARCore renders into it as before.
+        surfaceView = GLSurfaceView(this).apply {
+            keepScreenOn = true
+            preserveEGLContextOnPause = true
+            setEGLContextClientVersion(2)
+            setEGLConfigChooser(8, 8, 8, 8, 16, 0)
+            setRenderer(this@MainActivity)
+            renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
+            setWillNotDraw(false)
+        }
 
         frameRecorder = FrameRecorder(this)
         frameRecorder.onFrameSaved = { index, sessionName ->
-            runOnUiThread {
-                binding.statusText.text = getString(R.string.recording_status, sessionName, index)
-            }
+            runOnUiThread { uiState.onFrameSaved(sessionName, index) }
         }
         frameRecorder.onStatus = { message ->
-            // Only show diagnostics while recording; ignore once frames are flowing.
-            if (frameRecorder.isRecording) runOnUiThread { binding.statusText.text = message }
+            // Only surface diagnostics while recording; ignore once frames are flowing.
+            if (frameRecorder.isRecording) runOnUiThread { uiState.onMessage(message) }
         }
-        binding.recordButton.setOnClickListener { toggleRecording() }
+
+        setContent {
+            LanternTheme {
+                AndroidView(
+                    factory = { surfaceView },
+                    modifier = Modifier.fillMaxSize(),
+                )
+                CaptureOverlay(
+                    state = uiState,
+                    onToggleRecord = ::toggleRecording,
+                    onOpenSessions = {
+                        startActivity(Intent(this, SessionsActivity::class.java))
+                    },
+                )
+            }
+        }
     }
 
     private fun toggleRecording() {
@@ -83,15 +112,13 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             val name = frameRecorder.sessionName ?: "—"
             val count = frameRecorder.savedFrameCount
             frameRecorder.stop()
-            binding.recordButton.setText(R.string.record_start)
+            uiState.onRecordingStopped(name, count)
             val summary = getString(R.string.recording_saved, count, name)
-            binding.statusText.text = summary
             Toast.makeText(this, summary, Toast.LENGTH_LONG).show()
             Log.i(TAG, "Saved to ${frameRecorder.sessionPath}")
         } else {
             val name = frameRecorder.start()
-            binding.recordButton.setText(R.string.record_stop)
-            binding.statusText.text = getString(R.string.recording_status, name, 0)
+            uiState.onRecordingStarted(name)
         }
     }
 
@@ -121,8 +148,10 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         if (session != null) {
             // Stop recording before tearing down the session so no acquire races a pause.
             if (frameRecorder.isRecording) {
+                val name = frameRecorder.sessionName ?: "—"
+                val count = frameRecorder.savedFrameCount
                 frameRecorder.stop()
-                binding.recordButton.setText(R.string.record_start)
+                uiState.onRecordingStopped(name, count)
             }
             // Order matters: pause rendering before pausing the session.
             displayRotationHelper.onPause()
@@ -169,6 +198,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         // 3. Construct and configure the session.
         return try {
             val newSession = Session(this)
+            selectHighestResolutionCameraConfig(newSession)
             configureSession(newSession)
             session = newSession
             true
@@ -216,10 +246,27 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
         session.configure(config)
 
-        runOnUiThread {
-            binding.statusText.text = getString(R.string.depth_supported, supported.toString())
-            // Recording requires raw depth — only enable the control when supported.
-            binding.recordButton.isEnabled = supported
+        runOnUiThread { uiState.onDepthResolved(supported) }
+    }
+
+    /**
+     * Picks the ARCore [CameraConfig] with the largest CPU image size so recorded RGB
+     * frames are as sharp as the device allows (default is often ~640×480). Must run
+     * on a freshly-created, paused session before [configureSession]. Falls back
+     * silently to the default config if enumeration fails.
+     */
+    private fun selectHighestResolutionCameraConfig(session: Session) {
+        try {
+            val filter = CameraConfigFilter(session)
+            val configs: List<CameraConfig> = session.getSupportedCameraConfigs(filter)
+            val best = configs.maxByOrNull {
+                it.imageSize.width.toLong() * it.imageSize.height.toLong()
+            } ?: return
+            session.cameraConfig = best
+            Log.i(TAG, "Camera config: CPU image ${best.imageSize.width}x${best.imageSize.height}")
+        } catch (e: Exception) {
+            // Non-fatal: keep ARCore's default config rather than failing session setup.
+            Log.w(TAG, "Couldn't select a high-res camera config; using default.", e)
         }
     }
 
@@ -227,7 +274,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         if (messageShown == message) return
         messageShown = message
         runOnUiThread {
-            binding.statusText.text = message
+            uiState.onMessage(message, isError = true)
             Toast.makeText(this, message, Toast.LENGTH_LONG).show()
         }
         Log.w(TAG, message)
