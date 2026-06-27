@@ -1,0 +1,23 @@
+# Lantern host-side pipeline — Python dependencies
+#
+# Requires Python >= 3.10 (the pipeline uses zip(strict=True)).
+# Verified working on Python 3.12.13, macOS arm64.
+#
+# Setup (recommended — uv, no sudo):
+#   uv venv --python 3.12 .venv && uv pip install -r requirements.txt
+# Or with plain pip:
+#   python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#
+# NOTE: open3d must be >= 0.19 — 0.18 segfaults on NumPy 2.x (ABI mismatch).
+#       0.19 supports NumPy 2, so no numpy pin is needed.
+#
+# (import_and_clean.py runs inside Blender's bundled Python — NOT from this venv.)
+
+numpy==2.5.0
+scipy==1.17.1
+open3d==0.19.0
+trimesh==4.12.2
+opencv-python-headless==4.13.0.92
+
+# dev / tests
+pytest==9.1.1
