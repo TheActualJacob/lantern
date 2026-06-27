@@ -15,6 +15,39 @@
     <string name="save_confirm_title">%1$d frames saved</string>
     <string name="save_confirm_view">View</string>
 
+    <!-- Scanning UX: coaching, coverage guide, and correctness guardrails. -->
+    <string name="coach_title">How to scan an object</string>
+    <string name="coach_subtitle">A few habits make the 3D scan clean.</string>
+    <string name="coach_rule_surface_title">Place it on a flat surface</string>
+    <string name="coach_rule_surface_desc">Don\'t hold or rotate the object — moving objects break the scan.</string>
+    <string name="coach_rule_orbit_title">Move the phone slowly around it</string>
+    <string name="coach_rule_orbit_desc">Steady, gentle motion captures clean depth.</string>
+    <string name="coach_rule_no_spin_title">Orbit around it — don\'t spin in place</string>
+    <string name="coach_rule_no_spin_desc">Turning without moving gives no depth to work with.</string>
+    <string name="coach_rule_distance_title">Keep it centered, about 20–60 cm away</string>
+    <string name="coach_rule_distance_desc">Let the object fill the frame, not too close.</string>
+    <string name="coach_rule_sides_title">Cover all sides — top, sides, and angles</string>
+    <string name="coach_rule_sides_desc">Unseen faces become holes in the model.</string>
+    <string name="coach_rule_light_title">Use good, even lighting; avoid glare</string>
+    <string name="coach_rule_light_desc">Bright, soft light reads best.</string>
+    <string name="coach_rule_hands_title">Keep hands out of frame</string>
+    <string name="coach_rule_hands_desc">Fingers in view may end up in the scan — table placement keeps them out.</string>
+    <string name="coach_dismiss">Got it</string>
+    <string name="coach_help_cd">Scanning tips</string>
+
+    <!-- Prominent guardrail surfaced over the live feed. -->
+    <string name="guardrail_surface">Place the object on a surface — don\'t hold or rotate it</string>
+
+    <!-- Persistent low-key hint line and motion warning during capture. -->
+    <string name="hint_move_around">Move slowly around the object</string>
+    <string name="warn_pure_rotation">Move around the object, not just turning</string>
+
+    <!-- Coverage gizmo (pose-based viewing-direction ring). -->
+    <string name="coverage_title">Coverage</string>
+    <string name="coverage_locating">Locating…</string>
+    <string name="coverage_percent">%1$d%%</string>
+    <string name="coverage_cd">Scan coverage %1$d percent. Lit segments mark the angles you\'ve already captured; dim segments still need covering.</string>
+
     <!-- Sessions browser (P6 UX). -->
     <string name="sessions_title">Sessions</string>
     <string name="sessions_empty_title">No sessions yet</string>

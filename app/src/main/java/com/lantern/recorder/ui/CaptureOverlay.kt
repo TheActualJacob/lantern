@@ -37,6 +37,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -52,7 +53,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
@@ -68,7 +71,6 @@ import androidx.compose.ui.unit.dp
 import com.lantern.recorder.R
 import com.lantern.recorder.ui.theme.LanternNavy
 import com.lantern.recorder.ui.theme.RecordRed
-
 /**
  * The Compose overlay drawn on top of the live ARCore camera feed (a `GLSurfaceView`
  * hosted via `AndroidView`). It owns no camera state — it renders [state] and reports
@@ -84,6 +86,7 @@ fun CaptureOverlay(
     state: CaptureUiState,
     onToggleRecord: () -> Unit,
     onOpenSessions: () -> Unit,
+    onOpenHelp: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Box(modifier = modifier.fillMaxSize()) {
@@ -93,6 +96,34 @@ fun CaptureOverlay(
                 .align(Alignment.TopCenter)
                 .windowInsetsPadding(WindowInsets.statusBars)
                 .padding(top = 16.dp, start = 24.dp, end = 24.dp),
+        )
+
+        // Help affordance to re-open the scanning coach overlay (top-end corner).
+        IconButton(
+            onClick = onOpenHelp,
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .windowInsetsPadding(WindowInsets.statusBars)
+                .padding(top = 8.dp, end = 8.dp)
+                .size(48.dp)
+                .clip(CircleShape)
+                .drawBehind { drawCircle(Color.Black.copy(alpha = 0.35f)) },
+        ) {
+            Icon(
+                painter = painterResource(R.drawable.ic_help),
+                contentDescription = stringResource(R.string.coach_help_cd),
+                tint = Color.White,
+            )
+        }
+
+        // Persistent, low-key guidance: the "place on a surface" guardrail when idle,
+        // a "move around" hint as recording starts, and a pure-rotation warning.
+        GuidanceBanner(
+            state = state,
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .windowInsetsPadding(WindowInsets.statusBars)
+                .padding(top = 72.dp, start = 24.dp, end = 24.dp),
         )
 
         // Sessions FAB, anchored to the bottom-start above the gesture bar.
@@ -111,6 +142,19 @@ fun CaptureOverlay(
                 contentDescription = stringResource(R.string.sessions_title),
             )
         }
+
+        // Live pose-based coverage ring, bottom-end, while a session is recording.
+        CoverageGizmo(
+            visible = state.isRecording,
+            coveredMask = state.coveredMask,
+            currentSector = state.currentSector,
+            coveragePercent = state.coveragePercent,
+            objectLocked = state.objectLocked,
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .windowInsetsPadding(WindowInsets.navigationBars)
+                .padding(end = 24.dp, bottom = 44.dp),
+        )
 
         ShutterButton(
             recording = state.isRecording,
@@ -419,4 +463,160 @@ private fun statusPresentation(status: CaptureStatus): Triple<String, Color, Boo
 
     is CaptureStatus.Message ->
         Triple(status.text, if (status.isError) RecordRed else Color.White, false)
+}
+
+/**
+ * A single line of contextual guidance shown just under the status chip. It is a
+ * correctness aid, not decoration — in priority order it surfaces:
+ *  1. a pure-rotation warning (recording but the recorder isn't getting parallax),
+ *  2. a "move around the object" hint while a fresh recording warms up,
+ *  3. the "place it on a surface, don't hold/rotate" guardrail while idle.
+ * Once frames are flowing normally it yields to the status chip and hides itself.
+ */
+@Composable
+private fun GuidanceBanner(
+    state: CaptureUiState,
+    modifier: Modifier = Modifier,
+) {
+    data class Guidance(val text: String, val iconRes: Int, val warning: Boolean)
+
+    val guidance: Guidance? = when {
+        state.motionWarning ->
+            Guidance(stringResource(R.string.warn_pure_rotation), R.drawable.ic_no_spin, true)
+
+        state.isRecording && state.frameCount == 0 ->
+            Guidance(stringResource(R.string.hint_move_around), R.drawable.ic_orbit, false)
+
+        !state.isRecording && state.depthSupported ->
+            Guidance(stringResource(R.string.guardrail_surface), R.drawable.ic_surface, false)
+
+        else -> null
+    }
+
+    AnimatedVisibility(
+        visible = guidance != null,
+        enter = fadeIn(tween(220)) + slideInVertically(tween(220)) { -it / 3 },
+        exit = fadeOut(tween(160)) + slideOutVertically(tween(160)) { -it / 3 },
+        modifier = modifier,
+    ) {
+        val shown = remember(guidance) { guidance } ?: return@AnimatedVisibility
+        val accent = if (shown.warning) Color(0xFFFFC074) else Color.White
+        Surface(
+            color = if (shown.warning) Color(0xCC5A3A12) else Color.Black.copy(alpha = 0.5f),
+            contentColor = Color.White,
+            shape = RoundedCornerShape(50),
+            modifier = Modifier.semantics {
+                liveRegion = LiveRegionMode.Polite
+                contentDescription = shown.text
+            },
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
+            ) {
+                Icon(
+                    painter = painterResource(shown.iconRes),
+                    contentDescription = null,
+                    tint = accent,
+                    modifier = Modifier.size(18.dp),
+                )
+                Text(
+                    text = shown.text,
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Medium,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.clearAndSetSemantics {},
+                )
+            }
+        }
+    }
+}
+
+/**
+ * The pose-based coverage guide (Deliverable 2, v1 = **ring / 2D azimuth**). A small
+ * top-down orbit ring: each wedge is an azimuth sector around the object's estimated
+ * centroid; captured sectors light up green and the current one is highlighted white,
+ * with a live coverage percentage in the middle. Updates as `onFrameSaved` folds each
+ * keyframe pose into [CaptureUiState.coveredMask].
+ */
+@Composable
+private fun CoverageGizmo(
+    visible: Boolean,
+    coveredMask: Int,
+    currentSector: Int,
+    coveragePercent: Int,
+    objectLocked: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    AnimatedVisibility(
+        visible = visible,
+        enter = scaleIn(tween(220)) + fadeIn(tween(220)),
+        exit = scaleOut(tween(160)) + fadeOut(tween(160)),
+        modifier = modifier,
+    ) {
+        val coverageDesc = stringResource(R.string.coverage_cd, coveragePercent)
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .size(92.dp)
+                .clip(CircleShape)
+                .drawBehind { drawCircle(Color.Black.copy(alpha = 0.4f)) }
+                .semantics {
+                    liveRegion = LiveRegionMode.Polite
+                    contentDescription = coverageDesc
+                },
+        ) {
+            val sectors = CaptureUiState.COVERAGE_SECTORS
+            val coveredColor = Color(0xFF6BE675)
+            val currentColor = Color.White
+            val dimColor = Color.White.copy(alpha = 0.18f)
+
+            Canvas(Modifier.size(72.dp)) {
+                val sweep = 360f / sectors
+                val gap = sweep * 0.22f
+                val stroke = 7.dp.toPx()
+                val inset = stroke / 2f + 1.dp.toPx()
+                val arcSize = Size(size.width - inset * 2f, size.height - inset * 2f)
+                val topLeft = Offset(inset, inset)
+                for (i in 0 until sectors) {
+                    val covered = (coveredMask and (1 shl i)) != 0
+                    val color = when {
+                        i == currentSector -> currentColor
+                        covered -> coveredColor
+                        else -> dimColor
+                    }
+                    // Sector 0 at the top (12 o'clock); advance clockwise.
+                    val start = -90f + i * sweep + gap / 2f
+                    drawArc(
+                        color = color,
+                        startAngle = start,
+                        sweepAngle = sweep - gap,
+                        useCenter = false,
+                        topLeft = topLeft,
+                        size = arcSize,
+                        style = Stroke(width = stroke, cap = StrokeCap.Round),
+                    )
+                }
+            }
+
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(
+                    text = stringResource(R.string.coverage_percent, coveragePercent),
+                    style = MaterialTheme.typography.titleMedium,
+                    color = Color.White,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.clearAndSetSemantics {},
+                )
+                Text(
+                    text = stringResource(
+                        if (objectLocked) R.string.coverage_title else R.string.coverage_locating,
+                    ),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.White.copy(alpha = 0.7f),
+                    modifier = Modifier.clearAndSetSemantics {},
+                )
+            }
+        }
+    }
 }
