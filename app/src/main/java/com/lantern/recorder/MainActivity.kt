@@ -207,6 +207,13 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             Log.w(TAG, "Raw depth NOT supported on this device — depth disabled.")
             config.depthMode = Config.DepthMode.DISABLED
         }
+
+        // ARCore defaults to FIXED focus (tuned for tracking stability), which looks
+        // soft on nearby objects. AUTO gives a sharp, camera-app-like image. We record
+        // intrinsics per frame, so the focus-dependent focal-length change is captured.
+        config.focusMode = Config.FocusMode.AUTO
+        Log.i(TAG, "Focus mode = ${config.focusMode}")
+
         session.configure(config)
 
         runOnUiThread {
