@@ -5,6 +5,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import kotlin.math.atan2
+import kotlin.math.sqrt
 
 /**
  * What the status chip is currently communicating. Modeled as a sealed type so the
@@ -52,22 +53,37 @@ class CaptureUiState {
     var savedConfirmation by mutableStateOf<SavedConfirmation?>(null)
         private set
 
-    // ----- Pose-based coverage ring (Deliverable 2) -----
+    // ----- Pose-based coverage dome (Deliverable 2) -----
     //
-    // A v1 *ring* (2D azimuth coverage): the horizon around the object is split into
-    // [COVERAGE_SECTORS] equal wedges. For each saved keyframe we compute the direction
-    // from the object's estimated centroid to the camera and light up that wedge. The
-    // mask is a bitfield so it is cheaply Compose-observable.
+    // A v2 *dome* (azimuth + elevation coverage). The viewing hemisphere over the object
+    // is split into patches: two ringed elevation bands (sides + upper) each cut into
+    // [AZIMUTH_SECTORS] wedges, plus a single top cap. For each saved keyframe we take the
+    // direction from the object's depth-anchored centroid to the camera, bin it by azimuth
+    // and elevation, and light that patch — but only when the keyframe actually observed
+    // object surface from that direction (depth-gated). Masks are bitfields so they are
+    // cheaply Compose-observable.
 
-    /** Bitmask of covered azimuth sectors (bit i set => sector i captured). */
-    var coveredMask by mutableIntStateOf(0)
+    /** Bitmask of covered azimuth sectors in the lower (sides) band. */
+    var bandMaskSides by mutableIntStateOf(0)
         private set
 
-    /** Percentage of the orbit captured so far (0..100). */
+    /** Bitmask of covered azimuth sectors in the upper band. */
+    var bandMaskUpper by mutableIntStateOf(0)
+        private set
+
+    /** Whether the top cap (looking down on the object) has been covered. */
+    var topCovered by mutableStateOf(false)
+        private set
+
+    /** Percentage of dome patches captured so far (0..100). */
     var coveragePercent by mutableIntStateOf(0)
         private set
 
-    /** The sector the camera most recently sat in, or -1 before the first keyframe. */
+    /** The band the camera most recently sat in (0=sides, 1=upper, 2=top), or -1. */
+    var currentBand by mutableIntStateOf(-1)
+        private set
+
+    /** The azimuth sector the camera most recently sat in, or -1 (top cap / none). */
     var currentSector by mutableIntStateOf(-1)
         private set
 
@@ -97,45 +113,78 @@ class CaptureUiState {
         resetCoverage()
     }
 
-    /** Clears coverage so each recording starts from an empty ring. */
+    /** Clears coverage so each recording starts from an empty dome. */
     private fun resetCoverage() {
-        coveredMask = 0
+        bandMaskSides = 0
+        bandMaskUpper = 0
+        topCovered = false
         coveragePercent = 0
+        currentBand = -1
         currentSector = -1
         objectLocked = false
         motionWarning = false
     }
 
     /**
-     * Folds one saved keyframe into the coverage ring, using the camera position and the
-     * current best estimate of the object centroid (both ARCore world meters). The
+     * Folds one saved keyframe into the coverage dome, using the camera position and the
+     * current best estimate of the object centroid (both ARCore world meters, 3D). The
      * centroid is estimated in `MainActivity` from the raw depth at frame center and
-     * refined across keyframes; this only does the azimuth-sector bookkeeping. Called on
-     * the UI thread when [com.lantern.recorder.recording.FrameRecorder] commits a frame;
-     * the recorder itself is untouched.
+     * refined across keyframes; this only does the azimuth/elevation patch bookkeeping.
+     * Called on the UI thread when [com.lantern.recorder.recording.FrameRecorder] commits
+     * a frame; the recorder itself is untouched.
      *
-     * @param cameraX,cameraZ camera position on the gravity-horizontal plane
-     * @param centroidX,centroidZ estimated object centroid on the same plane
-     * @param depthAnchored whether [centroidX]/[centroidZ] came from real depth (vs guess)
+     * @param cameraX,cameraY,cameraZ camera position (ARCore world meters; Y is up)
+     * @param centroidX,centroidY,centroidZ estimated object centroid (same frame)
+     * @param surfaceObserved whether this keyframe saw real object surface (depth gate)
      */
     fun onKeyframeCoverage(
-        cameraX: Float, cameraZ: Float,
-        centroidX: Float, centroidZ: Float,
-        depthAnchored: Boolean,
+        cameraX: Float, cameraY: Float, cameraZ: Float,
+        centroidX: Float, centroidY: Float, centroidZ: Float,
+        surfaceObserved: Boolean,
     ) {
-        if (depthAnchored) objectLocked = true
-        // Direction from object to camera, projected onto the gravity-horizontal plane
-        // (ARCore world Y is up). Azimuth 0 is +Z; sectors advance counter-clockwise.
+        if (surfaceObserved) objectLocked = true
+        // Only credit coverage when the keyframe actually observed object surface from
+        // this direction — that's what makes it *surface* coverage, not just orbit angle.
+        if (!surfaceObserved) {
+            motionWarning = false
+            return
+        }
+
+        // Direction from object to camera (ARCore world Y is up).
         val dx = cameraX - centroidX
+        val dy = cameraY - centroidY
         val dz = cameraZ - centroidZ
-        if (dx * dx + dz * dz < 1e-6f) return
-        var az = atan2(dx, dz) // [-pi, pi]
-        if (az < 0f) az += (2.0 * Math.PI).toFloat()
-        val sector = ((az / (2.0 * Math.PI).toFloat()) * COVERAGE_SECTORS).toInt()
-            .coerceIn(0, COVERAGE_SECTORS - 1)
-        currentSector = sector
-        coveredMask = coveredMask or (1 shl sector)
-        coveragePercent = Integer.bitCount(coveredMask) * 100 / COVERAGE_SECTORS
+        val horiz = sqrt(dx * dx + dz * dz)
+        if (horiz < 1e-4f && kotlin.math.abs(dy) < 1e-4f) return
+
+        // Elevation above the object's horizontal plane, in degrees.
+        val elevationDeg = Math.toDegrees(atan2(dy, horiz).toDouble()).toFloat()
+
+        if (elevationDeg >= TOP_CAP_ELEVATION_DEG) {
+            // Looking down on the object — the azimuth-independent top cap.
+            topCovered = true
+            currentBand = 2
+            currentSector = -1
+        } else {
+            // Azimuth 0 is +Z; sectors advance counter-clockwise.
+            var az = atan2(dx, dz) // [-pi, pi]
+            if (az < 0f) az += (2.0 * Math.PI).toFloat()
+            val sector = ((az / (2.0 * Math.PI).toFloat()) * AZIMUTH_SECTORS).toInt()
+                .coerceIn(0, AZIMUTH_SECTORS - 1)
+            currentSector = sector
+            if (elevationDeg >= UPPER_BAND_ELEVATION_DEG) {
+                currentBand = 1
+                bandMaskUpper = bandMaskUpper or (1 shl sector)
+            } else {
+                currentBand = 0
+                bandMaskSides = bandMaskSides or (1 shl sector)
+            }
+        }
+
+        val covered = Integer.bitCount(bandMaskSides) +
+            Integer.bitCount(bandMaskUpper) +
+            (if (topCovered) 1 else 0)
+        coveragePercent = covered * 100 / TOTAL_PATCHES
         // Successful keyframes mean the user is translating; clear any rotation nag.
         motionWarning = false
     }
@@ -174,7 +223,16 @@ class CaptureUiState {
     }
 
     companion object {
-        /** Number of azimuth wedges in the coverage ring (15° each at 24). */
-        const val COVERAGE_SECTORS = 24
+        /** Azimuth wedges per ringed elevation band (30° each at 12). */
+        const val AZIMUTH_SECTORS = 12
+
+        /** Elevation (deg) at/above which a view counts as the azimuth-free top cap. */
+        const val TOP_CAP_ELEVATION_DEG = 60f
+
+        /** Elevation (deg) splitting the lower "sides" band from the "upper" band. */
+        const val UPPER_BAND_ELEVATION_DEG = 30f
+
+        /** Total dome patches: two ringed bands of [AZIMUTH_SECTORS] + one top cap. */
+        const val TOTAL_PATCHES = AZIMUTH_SECTORS * 2 + 1
     }
 }

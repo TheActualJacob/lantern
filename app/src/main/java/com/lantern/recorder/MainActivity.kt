@@ -80,7 +80,6 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private var centroidSumY = 0f
     private var centroidSumZ = 0f
     private var centroidSamples = 0
-    private var centroidDepthSamples = 0
 
     // Lightweight motion classifier for the "pure rotation / no translation" guardrail.
     // Evaluated over a sliding window from ARCore pose deltas; never touches the recorder.
@@ -182,7 +181,6 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         centroidSumY = 0f
         centroidSumZ = 0f
         centroidSamples = 0
-        centroidDepthSamples = 0
     }
 
     override fun onResume() {
@@ -420,20 +418,23 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             // Anchor the object centroid from the real depth at frame center. The coach
             // asks the user to keep the object centered, so the center depth ~= object
             // distance. Refine a running world-space mean; fall back to a fixed distance
-            // until depth is available so the ring still works on depth-less frames.
+            // until depth is available so the dome still works on depth-less frames.
             val centerDepthM = estimateCenterDepthMeters(frame)
             val dist = centerDepthM ?: FALLBACK_CENTROID_M
             centroidSumX += px + fx * dist
             centroidSumY += py + fy * dist
             centroidSumZ += pz + fz * dist
             centroidSamples++
-            if (centerDepthM != null) centroidDepthSamples++
 
             val cx = centroidSumX / centroidSamples
+            val cy = centroidSumY / centroidSamples
             val cz = centroidSumZ / centroidSamples
-            val depthAnchored = centroidDepthSamples > 0
+            // Surface is "observed" from this direction when this keyframe had a valid,
+            // in-range center depth — i.e. the object's surface was actually seen, which
+            // is what upgrades the dome from "orbit angle" to "surface coverage".
+            val surfaceObserved = centerDepthM != null
             runOnUiThread {
-                uiState.onKeyframeCoverage(px, pz, cx, cz, depthAnchored)
+                uiState.onKeyframeCoverage(px, py, pz, cx, cy, cz, surfaceObserved)
             }
         }
 

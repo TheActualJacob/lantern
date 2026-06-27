@@ -42,11 +42,13 @@
     <string name="hint_move_around">Move slowly around the object</string>
     <string name="warn_pure_rotation">Move around the object, not just turning</string>
 
-    <!-- Coverage gizmo (pose-based viewing-direction ring). -->
+    <!-- Coverage gizmo (pose-based viewing-direction dome). -->
     <string name="coverage_title">Coverage</string>
     <string name="coverage_locating">Locating…</string>
     <string name="coverage_percent">%1$d%%</string>
-    <string name="coverage_cd">Scan coverage %1$d percent. Lit segments mark the angles you\'ve already captured; dim segments still need covering.</string>
+    <string name="coverage_cd">Scan coverage %1$d percent. The dome shows the object from above: the center is the top, the outer ring is the sides. Lit patches are angles you\'ve captured; dim patches still need covering.</string>
+    <string name="coverage_hint_top">Capture the top — look down on it</string>
+    <string name="coverage_hint_sides">Cover the remaining sides</string>
 
     <!-- Sessions browser (P6 UX). -->
     <string name="sessions_title">Sessions</string>

@@ -143,10 +143,13 @@ fun CaptureOverlay(
             )
         }
 
-        // Live pose-based coverage ring, bottom-end, while a session is recording.
+        // Live pose-based coverage dome, bottom-end, while a session is recording.
         CoverageGizmo(
             visible = state.isRecording,
-            coveredMask = state.coveredMask,
+            bandMaskSides = state.bandMaskSides,
+            bandMaskUpper = state.bandMaskUpper,
+            topCovered = state.topCovered,
+            currentBand = state.currentBand,
             currentSector = state.currentSector,
             coveragePercent = state.coveragePercent,
             objectLocked = state.objectLocked,
@@ -534,16 +537,21 @@ private fun GuidanceBanner(
 }
 
 /**
- * The pose-based coverage guide (Deliverable 2, v1 = **ring / 2D azimuth**). A small
- * top-down orbit ring: each wedge is an azimuth sector around the object's estimated
- * centroid; captured sectors light up green and the current one is highlighted white,
- * with a live coverage percentage in the middle. Updates as `onFrameSaved` folds each
- * keyframe pose into [CaptureUiState.coveredMask].
+ * The pose-based coverage guide (Deliverable 2, v2 = **dome / azimuth + elevation**).
+ * A small top-down polar map of the viewing hemisphere over the object: the filled
+ * center is the top cap (looking straight down), the middle ring is the upper band, and
+ * the outer ring is the sides. Each ring is cut into azimuth wedges. Captured patches
+ * light green, the current one is highlighted white, uncovered patches stay dim. Updates
+ * as `onFrameSaved` folds each depth-gated keyframe into the dome masks. A live coverage
+ * percentage and a "what's missing" hint sit beneath the dome.
  */
 @Composable
 private fun CoverageGizmo(
     visible: Boolean,
-    coveredMask: Int,
+    bandMaskSides: Int,
+    bandMaskUpper: Int,
+    topCovered: Boolean,
+    currentBand: Int,
     currentSector: Int,
     coveragePercent: Int,
     objectLocked: Boolean,
@@ -556,64 +564,95 @@ private fun CoverageGizmo(
         modifier = modifier,
     ) {
         val coverageDesc = stringResource(R.string.coverage_cd, coveragePercent)
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier = Modifier
-                .size(92.dp)
-                .clip(CircleShape)
-                .drawBehind { drawCircle(Color.Black.copy(alpha = 0.4f)) }
-                .semantics {
-                    liveRegion = LiveRegionMode.Polite
-                    contentDescription = coverageDesc
-                },
+        // Once the user has orbited the sides but hasn't looked down on it, nudge them
+        // toward the top — the dome's whole point is exposing that missing dimension.
+        val sidesDone = Integer.bitCount(bandMaskSides) >= CaptureUiState.AZIMUTH_SECTORS
+        val sublabel = when {
+            !objectLocked -> stringResource(R.string.coverage_locating)
+            !topCovered && sidesDone -> stringResource(R.string.coverage_hint_top)
+            else -> stringResource(R.string.coverage_title)
+        }
+        Surface(
+            color = Color.Black.copy(alpha = 0.42f),
+            shape = RoundedCornerShape(18.dp),
+            modifier = Modifier.semantics {
+                liveRegion = LiveRegionMode.Polite
+                contentDescription = coverageDesc
+            },
         ) {
-            val sectors = CaptureUiState.COVERAGE_SECTORS
-            val coveredColor = Color(0xFF6BE675)
-            val currentColor = Color.White
-            val dimColor = Color.White.copy(alpha = 0.18f)
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            ) {
+                val coveredColor = Color(0xFF6BE675)
+                val currentColor = Color.White
+                val dimColor = Color.White.copy(alpha = 0.16f)
+                val sectors = CaptureUiState.AZIMUTH_SECTORS
 
-            Canvas(Modifier.size(72.dp)) {
-                val sweep = 360f / sectors
-                val gap = sweep * 0.22f
-                val stroke = 7.dp.toPx()
-                val inset = stroke / 2f + 1.dp.toPx()
-                val arcSize = Size(size.width - inset * 2f, size.height - inset * 2f)
-                val topLeft = Offset(inset, inset)
-                for (i in 0 until sectors) {
-                    val covered = (coveredMask and (1 shl i)) != 0
-                    val color = when {
-                        i == currentSector -> currentColor
-                        covered -> coveredColor
+                Canvas(Modifier.size(74.dp)) {
+                    val center = Offset(size.width / 2f, size.height / 2f)
+                    val rOuter = size.minDimension / 2f - 1.dp.toPx()
+                    val stroke = rOuter * 0.26f
+                    val gap = rOuter * 0.07f
+                    val sidesRadius = rOuter - stroke / 2f
+                    val upperRadius = sidesRadius - stroke - gap
+                    val capRadius = (upperRadius - stroke / 2f - gap).coerceAtLeast(3.dp.toPx())
+
+                    val sweep = 360f / sectors
+                    val angGap = sweep * 0.2f
+
+                    // Draw one ringed band of azimuth wedges at [radius].
+                    fun drawBand(mask: Int, band: Int, radius: Float) {
+                        val boxTopLeft = Offset(center.x - radius, center.y - radius)
+                        val boxSize = Size(radius * 2f, radius * 2f)
+                        for (i in 0 until sectors) {
+                            val covered = (mask and (1 shl i)) != 0
+                            val color = when {
+                                band == currentBand && i == currentSector -> currentColor
+                                covered -> coveredColor
+                                else -> dimColor
+                            }
+                            // Sector 0 at the top (12 o'clock); advance clockwise.
+                            val start = -90f + i * sweep + angGap / 2f
+                            drawArc(
+                                color = color,
+                                startAngle = start,
+                                sweepAngle = sweep - angGap,
+                                useCenter = false,
+                                topLeft = boxTopLeft,
+                                size = boxSize,
+                                style = Stroke(width = stroke, cap = StrokeCap.Round),
+                            )
+                        }
+                    }
+
+                    // Outer = sides, middle = upper band.
+                    drawBand(bandMaskSides, band = 0, radius = sidesRadius)
+                    drawBand(bandMaskUpper, band = 1, radius = upperRadius)
+
+                    // Center disc = top cap.
+                    val capColor = when {
+                        currentBand == 2 -> currentColor
+                        topCovered -> coveredColor
                         else -> dimColor
                     }
-                    // Sector 0 at the top (12 o'clock); advance clockwise.
-                    val start = -90f + i * sweep + gap / 2f
-                    drawArc(
-                        color = color,
-                        startAngle = start,
-                        sweepAngle = sweep - gap,
-                        useCenter = false,
-                        topLeft = topLeft,
-                        size = arcSize,
-                        style = Stroke(width = stroke, cap = StrokeCap.Round),
-                    )
+                    drawCircle(color = capColor, radius = capRadius, center = center)
                 }
-            }
 
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(
                     text = stringResource(R.string.coverage_percent, coveragePercent),
                     style = MaterialTheme.typography.titleMedium,
                     color = Color.White,
                     fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.clearAndSetSemantics {},
+                    modifier = Modifier
+                        .padding(top = 6.dp)
+                        .clearAndSetSemantics {},
                 )
                 Text(
-                    text = stringResource(
-                        if (objectLocked) R.string.coverage_title else R.string.coverage_locating,
-                    ),
+                    text = sublabel,
                     style = MaterialTheme.typography.labelSmall,
                     color = Color.White.copy(alpha = 0.7f),
+                    textAlign = TextAlign.Center,
                     modifier = Modifier.clearAndSetSemantics {},
                 )
             }
