@@ -30,6 +30,34 @@ sealed interface CaptureStatus {
 data class SavedConfirmation(val session: String, val frames: Int)
 
 /**
+ * The stage of an optional **two-pass "flip the object" scan**, which captures the face
+ * the object was resting on by having the user flip it and scan again. Single-pass scans
+ * stay in [SinglePass] the whole time.
+ */
+enum class ScanPhase {
+    /** Normal one-sided scan (or idle). The flip flow is not engaged. */
+    SinglePass,
+
+    /** Recording the first side. */
+    PassOne,
+
+    /** First side is sufficiently covered; waiting for the user to flip the object. */
+    NeedsFlip,
+
+    /** The object has been picked up / is being moved. */
+    Flipping,
+
+    /** The object has settled into a new resting pose; ready to scan the second side. */
+    ReadyForPassTwo,
+
+    /** Recording the second side. */
+    PassTwo,
+
+    /** Both sides captured. */
+    Complete,
+}
+
+/**
  * Compose-observable UI state for the capture screen. Owned by `MainActivity`, which
  * updates it (on the UI thread) from the ARCore session + [com.lantern.recorder.recording.FrameRecorder]
  * callbacks. The recorder and GL rendering remain the source of truth; this is a thin
@@ -98,6 +126,30 @@ class CaptureUiState {
     var objectLocked by mutableStateOf(false)
         private set
 
+    // ----- Two-pass "flip the object" flow -----
+
+    /** User opt-in: capture both sides by flipping the object between two passes. */
+    var twoPassEnabled by mutableStateOf(false)
+        private set
+
+    /** Current stage of the (optional) flip flow. */
+    var scanPhase by mutableStateOf(ScanPhase.SinglePass)
+        private set
+
+    /** Transient warning that the object appears to have moved mid-pass (breaks fusion). */
+    var objectMovedWarning by mutableStateOf(false)
+        private set
+
+    /**
+     * Fired (on the UI thread) when a pass auto-completes and recording should stop, so
+     * `MainActivity` can cut the recording cleanly before the user flips the object. Set
+     * by the activity; the recorder's own logic is never modified.
+     */
+    var onRequestStopRecording: (() -> Unit)? = null
+
+    /** True once the current pass has covered enough of the reachable hemisphere. */
+    private var passCompleteFired = false
+
     fun onDepthResolved(supported: Boolean) {
         depthSupported = supported
         // Don't clobber an active recording / error message with the idle depth state.
@@ -111,6 +163,22 @@ class CaptureUiState {
         frameCount = 0
         status = CaptureStatus.Recording(session, 0)
         resetCoverage()
+        passCompleteFired = false
+        objectMovedWarning = false
+        // In two-pass mode, recording is always a labelled pass; otherwise single.
+        scanPhase = when {
+            !twoPassEnabled -> ScanPhase.SinglePass
+            scanPhase == ScanPhase.ReadyForPassTwo -> ScanPhase.PassTwo
+            else -> ScanPhase.PassOne
+        }
+    }
+
+    /** Opts the next scan into (or out of) the two-pass flip flow. Idle/pre-record only. */
+    fun toggleTwoPass(enabled: Boolean) {
+        if (isRecording) return
+        twoPassEnabled = enabled
+        scanPhase = ScanPhase.SinglePass
+        objectMovedWarning = false
     }
 
     /** Clears coverage so each recording starts from an empty dome. */
@@ -187,6 +255,56 @@ class CaptureUiState {
         coveragePercent = covered * 100 / TOTAL_PATCHES
         // Successful keyframes mean the user is translating; clear any rotation nag.
         motionWarning = false
+
+        // In two-pass mode, once the reachable hemisphere is sufficiently covered, end
+        // this pass: ask the activity to stop recording and advance the flip flow.
+        maybeCompletePass()
+    }
+
+    /** Whether the reachable hemisphere is covered enough to end the current pass. */
+    private fun passCoverageComplete(): Boolean {
+        // Both ringed bands fully around plus a healthy overall percentage. The top cap
+        // is not required (it's awkward to hit, and becomes a side after the flip anyway).
+        val sidesFull = Integer.bitCount(bandMaskSides) >= AZIMUTH_SECTORS
+        val upperFull = Integer.bitCount(bandMaskUpper) >= AZIMUTH_SECTORS
+        return (sidesFull && upperFull) || coveragePercent >= PASS_COMPLETE_PERCENT
+    }
+
+    /** Fires the one-shot pass-complete transition during a two-pass scan. */
+    private fun maybeCompletePass() {
+        if (passCompleteFired) return
+        if (scanPhase != ScanPhase.PassOne && scanPhase != ScanPhase.PassTwo) return
+        if (!passCoverageComplete()) return
+        passCompleteFired = true
+        scanPhase = if (scanPhase == ScanPhase.PassOne) ScanPhase.NeedsFlip else ScanPhase.Complete
+        // Cut the recording cleanly before the object is handled.
+        onRequestStopRecording?.invoke()
+    }
+
+    /**
+     * Feeds a [com.lantern.recorder.scanning.FlipDetector] reading into the flip flow.
+     * Driven by `MainActivity` from depth-derived disturb/settle signals on the GL thread.
+     *
+     * @param disturbed object appears picked up / moving
+     * @param settled object has come to rest at a new pose
+     */
+    fun onFlipReading(disturbed: Boolean, settled: Boolean) {
+        when (scanPhase) {
+            ScanPhase.NeedsFlip -> if (disturbed) scanPhase = ScanPhase.Flipping
+            ScanPhase.Flipping -> {
+                if (settled) scanPhase = ScanPhase.ReadyForPassTwo
+            }
+            ScanPhase.ReadyForPassTwo -> {
+                // If it gets picked up again before pass two starts, fall back.
+                if (disturbed && !settled) scanPhase = ScanPhase.Flipping
+            }
+            else -> { /* not in the flip-watch window */ }
+        }
+    }
+
+    /** Surfaces / clears the "object moved during the scan" warning (recording only). */
+    fun onObjectMoved(moved: Boolean) {
+        objectMovedWarning = isRecording && moved
     }
 
     /**
@@ -206,10 +324,24 @@ class CaptureUiState {
         isRecording = false
         frameCount = frames
         motionWarning = false
+        objectMovedWarning = false
         // Revert the chip to its idle depth state and surface a transient save card
         // instead of letting a "Saved…" message linger in the chip.
         status = CaptureStatus.DepthReady(depthSupported)
         if (frames > 0) savedConfirmation = SavedConfirmation(session, frames)
+        // If a single-pass scan (or a two-pass scan that wasn't auto-completing) just
+        // stopped, return the flow to its idle single-pass state. Auto-completed passes
+        // are advanced separately in maybeCompletePass(), so don't clobber those.
+        if (!passCompleteFired && scanPhase != ScanPhase.ReadyForPassTwo) {
+            scanPhase = ScanPhase.SinglePass
+        }
+    }
+
+    /** Resets the flip flow to idle (e.g. after the two-pass scan is fully done). */
+    fun resetScanFlow() {
+        scanPhase = ScanPhase.SinglePass
+        passCompleteFired = false
+        objectMovedWarning = false
     }
 
     /** Dismisses the transient save confirmation (after its timeout or on tap). */
@@ -234,5 +366,8 @@ class CaptureUiState {
 
         /** Total dome patches: two ringed bands of [AZIMUTH_SECTORS] + one top cap. */
         const val TOTAL_PATCHES = AZIMUTH_SECTORS * 2 + 1
+
+        /** Coverage (%) at which a pass is considered complete in the two-pass flow. */
+        const val PASS_COMPLETE_PERCENT = 75
     }
 }

@@ -31,11 +31,18 @@ import com.google.ar.core.exceptions.UnavailableUserDeclinedInstallationExceptio
 import com.lantern.recorder.recording.FrameRecorder
 import com.lantern.recorder.rendering.BackgroundRenderer
 import com.lantern.recorder.rendering.DisplayRotationHelper
+import com.lantern.recorder.scanning.FlipDetector
+import com.lantern.recorder.sessions.SessionStore
 import com.lantern.recorder.sessions.SessionsActivity
 import com.lantern.recorder.ui.CaptureOverlay
 import com.lantern.recorder.ui.CaptureUiState
 import com.lantern.recorder.ui.CoachOverlay
+import com.lantern.recorder.ui.ScanPhase
 import com.lantern.recorder.ui.theme.LanternTheme
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.abs
@@ -81,6 +88,18 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private var centroidSumZ = 0f
     private var centroidSamples = 0
 
+    // Two-pass "flip the object" flow. The detector classifies disturb/settle from the
+    // depth-derived center point; the rest is grouping metadata so the host can merge the
+    // two passes. All read-only w.r.t. the recorder.
+    private val flipDetector = FlipDetector()
+    private var lastFlipTickMs = 0L
+    private var scanGroupId: String? = null
+    // Seed for the second pass's centroid, captured when the object settles after a flip.
+    private var passTwoSeedX = 0f
+    private var passTwoSeedY = 0f
+    private var passTwoSeedZ = 0f
+    private var hasPassTwoSeed = false
+
     // Lightweight motion classifier for the "pure rotation / no translation" guardrail.
     // Evaluated over a sliding window from ARCore pose deltas; never touches the recorder.
     private var motionAnchorX = 0f
@@ -117,6 +136,9 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             // Only surface diagnostics while recording; ignore once frames are flowing.
             if (frameRecorder.isRecording) runOnUiThread { uiState.onMessage(message) }
         }
+        // When a two-pass pass auto-completes, cut the recording cleanly before the user
+        // handles the object. Fired on the UI thread from the coverage bookkeeping.
+        uiState.onRequestStopRecording = { autoStopForFlip() }
 
         setContent {
             LanternTheme {
@@ -132,6 +154,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 CaptureOverlay(
                     state = uiState,
                     onToggleRecord = ::toggleRecording,
+                    onToggleTwoPass = { enabled -> uiState.toggleTwoPass(enabled) },
                     onOpenSessions = {
                         startActivity(Intent(this, SessionsActivity::class.java))
                     },
@@ -156,6 +179,10 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             showMessage(getString(R.string.depth_unsupported_no_record))
             return
         }
+        // Block the shutter mid-flip: the object is being handled, not scanned.
+        if (uiState.scanPhase == ScanPhase.NeedsFlip || uiState.scanPhase == ScanPhase.Flipping) {
+            return
+        }
         if (frameRecorder.isRecording) {
             val name = frameRecorder.sessionName ?: "—"
             val count = frameRecorder.savedFrameCount
@@ -164,10 +191,72 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             resetMotionTracking()
             Log.i(TAG, "Saved $count frames to ${frameRecorder.sessionPath}")
         } else {
+            // Starting a fresh two-pass scan after a completed one: reset the flow first.
+            if (uiState.scanPhase == ScanPhase.Complete) {
+                uiState.resetScanFlow()
+                scanGroupId = null
+            }
+            val startingPassTwo = uiState.twoPassEnabled &&
+                uiState.scanPhase == ScanPhase.ReadyForPassTwo
+            // Stamp a group id when the first pass of a two-pass scan begins.
+            if (uiState.twoPassEnabled && !startingPassTwo) {
+                scanGroupId = "group_" + STAMP.format(Date())
+            }
             val name = frameRecorder.start()
             uiState.onRecordingStarted(name)
             lastCoverageCount = 0
             resetMotionTracking()
+            flipDetector.clear()
+            // Seed pass two's centroid with the settled object location for a fast lock.
+            if (startingPassTwo && hasPassTwoSeed) {
+                centroidSumX = passTwoSeedX
+                centroidSumY = passTwoSeedY
+                centroidSumZ = passTwoSeedZ
+                centroidSamples = 1
+            }
+            hasPassTwoSeed = false
+        }
+    }
+
+    /**
+     * Cuts the current pass's recording when its coverage auto-completes, writes the
+     * pass's grouping metadata, and arms flip detection (after pass one). Runs on the UI
+     * thread; only uses the recorder's public API.
+     */
+    private fun autoStopForFlip() {
+        if (!frameRecorder.isRecording) return
+        val name = frameRecorder.sessionName ?: "—"
+        val count = frameRecorder.savedFrameCount
+        val path = frameRecorder.sessionPath
+        frameRecorder.stop()
+        uiState.onRecordingStopped(name, count)
+        Log.i(TAG, "Pass auto-stopped: saved $count frames to $path")
+
+        val groupId = scanGroupId
+        when (uiState.scanPhase) {
+            ScanPhase.NeedsFlip -> {
+                // Pass one done: tag it and arm the flip detector against the object's
+                // current location so we can tell when it's lifted and re-set-down.
+                if (groupId != null && path != null) {
+                    SessionStore.writeScanGroup(File(path), groupId, pass = 1, totalPasses = 2)
+                }
+                if (centroidSamples > 0) {
+                    flipDetector.setReference(
+                        centroidSumX / centroidSamples,
+                        centroidSumY / centroidSamples,
+                        centroidSumZ / centroidSamples,
+                    )
+                }
+                lastFlipTickMs = 0L
+            }
+            ScanPhase.Complete -> {
+                // Pass two done: tag it; the two sessions are now a mergeable group.
+                if (groupId != null && path != null) {
+                    SessionStore.writeScanGroup(File(path), groupId, pass = 2, totalPasses = 2)
+                }
+                flipDetector.clear()
+            }
+            else -> { /* no-op */ }
         }
     }
 
@@ -215,6 +304,9 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 uiState.onRecordingStopped(name, count)
                 resetMotionTracking()
             }
+            // Abandon any in-progress flip flow rather than resuming mid-flip later.
+            uiState.resetScanFlow()
+            flipDetector.clear()
             // Order matters: pause rendering before pausing the session.
             displayRotationHelper.onPause()
             surfaceView.onPause()
@@ -388,10 +480,54 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             // Pose-based scanning guidance (UI only): fold newly-committed keyframes
             // into the coverage ring and classify motion for the rotation guardrail.
             updateScanGuidance(frame)
+            // Between passes of a two-pass scan, watch (depth-based) for the object being
+            // flipped and set back down. Cheap, throttled, and only while not recording.
+            updateFlipWatch(frame)
         } catch (t: Throwable) {
             // Never let an exception escape the GL thread.
             Log.e(TAG, "Exception on the GL thread", t)
         }
+    }
+
+    /**
+     * While paused between two-pass passes ([ScanPhase.NeedsFlip] / [ScanPhase.Flipping] /
+     * [ScanPhase.ReadyForPassTwo]), samples the center depth on a throttle and feeds the
+     * [FlipDetector] so the UI can tell when the object is being flipped and when it has
+     * settled into a new pose. Recorder is idle here, so the extra depth acquire is free.
+     */
+    private fun updateFlipWatch(frame: com.google.ar.core.Frame) {
+        if (!uiState.twoPassEnabled) return
+        val phase = uiState.scanPhase
+        if (phase != ScanPhase.NeedsFlip && phase != ScanPhase.Flipping &&
+            phase != ScanPhase.ReadyForPassTwo
+        ) {
+            return
+        }
+        val nowMs = SystemClock.elapsedRealtime()
+        if (nowMs - lastFlipTickMs < FLIP_TICK_MS) return
+        lastFlipTickMs = nowMs
+
+        val camera = frame.camera
+        if (camera.trackingState != com.google.ar.core.TrackingState.TRACKING) return
+        val pose = camera.pose
+
+        val depth = estimateCenterDepthMeters(frame)
+        val hasPoint = depth != null
+        var x = 0f; var y = 0f; var z = 0f
+        if (depth != null) {
+            val zAxis = pose.zAxis
+            x = pose.tx() + (-zAxis[0]) * depth
+            y = pose.ty() + (-zAxis[1]) * depth
+            z = pose.tz() + (-zAxis[2]) * depth
+        }
+        val reading = flipDetector.update(hasPoint, x, y, z, nowMs)
+        if (reading.settled) {
+            passTwoSeedX = reading.settleX
+            passTwoSeedY = reading.settleY
+            passTwoSeedZ = reading.settleZ
+            hasPassTwoSeed = true
+        }
+        runOnUiThread { uiState.onFlipReading(reading.disturbed, reading.settled) }
     }
 
     /**
@@ -433,8 +569,23 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             // in-range center depth — i.e. the object's surface was actually seen, which
             // is what upgrades the dome from "orbit angle" to "surface coverage".
             val surfaceObserved = centerDepthM != null
+
+            // Object-moved guard: the point the center ray hits should stay near the
+            // running centroid while the object is still. A large, repeated deviation
+            // means the object was bumped/moved mid-pass, which corrupts fusion.
+            val objectMoved = if (centerDepthM != null && centroidSamples > MIN_SAMPLES_FOR_MOVE_CHECK) {
+                val obsX = px + fx * dist
+                val obsY = py + fy * dist
+                val obsZ = pz + fz * dist
+                val ddx = obsX - cx; val ddy = obsY - cy; val ddz = obsZ - cz
+                kotlin.math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz) > OBJECT_MOVED_M
+            } else {
+                false
+            }
+
             runOnUiThread {
                 uiState.onKeyframeCoverage(px, py, pz, cx, cy, cz, surfaceObserved)
+                uiState.onObjectMoved(objectMoved)
             }
         }
 
@@ -539,5 +690,11 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         private const val DEPTH_MIN_M = 0.12f
         private const val DEPTH_MAX_M = 1.2f
         private const val FALLBACK_CENTROID_M = 0.35f
+
+        // Two-pass flip flow.
+        private const val FLIP_TICK_MS = 120L
+        private const val OBJECT_MOVED_M = 0.10f
+        private const val MIN_SAMPLES_FOR_MOVE_CHECK = 4
+        private val STAMP = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
     }
 }

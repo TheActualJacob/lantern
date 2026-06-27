@@ -52,6 +52,22 @@
     <string name="coverage_hint_top">Capture the top — look down on it</string>
     <string name="coverage_hint_sides">Cover the remaining sides</string>
 
+    <!-- Two-pass "flip the object" flow (capture the resting face). -->
+    <string name="twopass_label">Two-sided scan</string>
+    <string name="twopass_enable_cd">Enable two-sided scan: capture the bottom by flipping the object</string>
+    <string name="twopass_disable_cd">Disable two-sided scan</string>
+    <string name="flip_pass_indicator">Side %1$d of 2</string>
+    <string name="flip_needed_title">Side 1 captured</string>
+    <string name="flip_needed_body">Flip the object so a new face rests on the surface.</string>
+    <string name="flip_inprogress_title">Flipping detected…</string>
+    <string name="flip_inprogress_body">Set it back down when you\'re ready.</string>
+    <string name="flip_ready_title">New side detected</string>
+    <string name="flip_ready_body">Tap the shutter to scan side 2.</string>
+    <string name="flip_complete_title">Both sides captured</string>
+    <string name="flip_complete_body">The two passes will be merged into one model.</string>
+    <string name="object_moved_warning">Object moved — keep it still on the surface</string>
+    <string name="a11y_start_pass_two">Start scanning side 2</string>
+
     <!-- Sessions browser (P6 UX). -->
     <string name="sessions_title">Sessions</string>
     <string name="sessions_empty_title">No sessions yet</string>

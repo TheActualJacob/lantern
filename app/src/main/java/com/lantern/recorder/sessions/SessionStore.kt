@@ -22,6 +22,36 @@ object SessionStore {
     fun sessionsRoot(context: Context): File =
         File(context.getExternalFilesDir(null), "sessions").apply { mkdirs() }
 
+    /**
+     * Writes a `scan_group.json` sidecar into a recorded session folder, marking it as one
+     * pass of a multi-pass "flip the object" capture so the host reconstruction pipeline
+     * can register and merge the passes (e.g. ICP) into a single watertight model.
+     *
+     * This is a separate metadata file written *after* recording stops — it does not touch
+     * the [com.lantern.recorder.recording.FrameRecorder] or any captured frame data.
+     *
+     * @param sessionDir the `session_*` folder to annotate
+     * @param groupId shared id linking all passes of one object
+     * @param pass 1-based pass index within the group
+     * @param totalPasses expected number of passes in the group
+     */
+    fun writeScanGroup(sessionDir: File, groupId: String, pass: Int, totalPasses: Int) {
+        try {
+            val json = """
+                {
+                  "group_id": "$groupId",
+                  "pass": $pass,
+                  "total_passes": $totalPasses,
+                  "merge": "flip",
+                  "note": "Pass $pass of $totalPasses. Object was flipped between passes; the recorded poses are not in a shared frame across passes — register/merge (e.g. ICP) downstream."
+                }
+            """.trimIndent()
+            File(sessionDir, "scan_group.json").writeText(json)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to write scan_group.json in ${sessionDir.absolutePath}", e)
+        }
+    }
+
     /** Lists sessions newest-first. Frame count is derived from `frame_*.json` files. */
     fun listSessions(context: Context): List<SessionInfo> {
         val root = sessionsRoot(context)

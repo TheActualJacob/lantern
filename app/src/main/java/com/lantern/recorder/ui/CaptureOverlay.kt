@@ -85,6 +85,7 @@ import com.lantern.recorder.ui.theme.RecordRed
 fun CaptureOverlay(
     state: CaptureUiState,
     onToggleRecord: () -> Unit,
+    onToggleTwoPass: (Boolean) -> Unit,
     onOpenSessions: () -> Unit,
     onOpenHelp: () -> Unit,
     modifier: Modifier = Modifier,
@@ -96,6 +97,17 @@ fun CaptureOverlay(
                 .align(Alignment.TopCenter)
                 .windowInsetsPadding(WindowInsets.statusBars)
                 .padding(top = 16.dp, start = 24.dp, end = 24.dp),
+        )
+
+        // Top-start: a two-sided-scan toggle before recording, or the live pass indicator
+        // once a two-pass flip scan is underway.
+        TopStartControls(
+            state = state,
+            onToggleTwoPass = onToggleTwoPass,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .windowInsetsPadding(WindowInsets.statusBars)
+                .padding(top = 14.dp, start = 16.dp),
         )
 
         // Help affordance to re-open the scanning coach overlay (top-end corner).
@@ -124,6 +136,14 @@ fun CaptureOverlay(
                 .align(Alignment.TopCenter)
                 .windowInsetsPadding(WindowInsets.statusBars)
                 .padding(top = 72.dp, start = 24.dp, end = 24.dp),
+        )
+
+        // Prominent, can't-miss flip-flow card (only during the two-pass flip sequence).
+        FlipFlowBanner(
+            phase = state.scanPhase,
+            modifier = Modifier
+                .align(Alignment.Center)
+                .padding(horizontal = 32.dp),
         )
 
         // Sessions FAB, anchored to the bottom-start above the gesture bar.
@@ -159,10 +179,16 @@ fun CaptureOverlay(
                 .padding(end = 24.dp, bottom = 44.dp),
         )
 
+        // The shutter is blocked mid-flip (object being handled); in ReadyForPassTwo it
+        // invites the user to start the second side.
+        val flipBlocked = state.scanPhase == ScanPhase.NeedsFlip ||
+            state.scanPhase == ScanPhase.Flipping
+        val startPassTwo = state.scanPhase == ScanPhase.ReadyForPassTwo
         ShutterButton(
             recording = state.isRecording,
-            enabled = state.depthSupported,
+            enabled = state.depthSupported && !flipBlocked,
             frameCount = state.frameCount,
+            startPassTwo = startPassTwo,
             onClick = onToggleRecord,
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -341,6 +367,7 @@ private fun ShutterButton(
     recording: Boolean,
     enabled: Boolean,
     frameCount: Int,
+    startPassTwo: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -378,6 +405,7 @@ private fun ShutterButton(
     val contentDesc = when {
         !enabled -> stringResource(R.string.depth_unsupported_no_record)
         recording -> stringResource(R.string.a11y_stop_recording)
+        startPassTwo -> stringResource(R.string.a11y_start_pass_two)
         else -> stringResource(R.string.a11y_start_recording)
     }
 
@@ -471,10 +499,11 @@ private fun statusPresentation(status: CaptureStatus): Triple<String, Color, Boo
 /**
  * A single line of contextual guidance shown just under the status chip. It is a
  * correctness aid, not decoration — in priority order it surfaces:
- *  1. a pure-rotation warning (recording but the recorder isn't getting parallax),
- *  2. a "move around the object" hint while a fresh recording warms up,
- *  3. the "place it on a surface, don't hold/rotate" guardrail while idle.
- * Once frames are flowing normally it yields to the status chip and hides itself.
+ *  1. an "object moved" warning (the object was bumped mid-pass — breaks fusion),
+ *  2. a pure-rotation warning (recording but the recorder isn't getting parallax),
+ *  3. a "move around the object" hint while a fresh recording warms up,
+ *  4. the "place it on a surface, don't hold/rotate" guardrail while idle.
+ * Hidden during the flip flow (the prominent flip card speaks instead).
  */
 @Composable
 private fun GuidanceBanner(
@@ -483,7 +512,17 @@ private fun GuidanceBanner(
 ) {
     data class Guidance(val text: String, val iconRes: Int, val warning: Boolean)
 
+    val inFlipFlow = state.scanPhase == ScanPhase.NeedsFlip ||
+        state.scanPhase == ScanPhase.Flipping ||
+        state.scanPhase == ScanPhase.ReadyForPassTwo ||
+        state.scanPhase == ScanPhase.Complete
+
     val guidance: Guidance? = when {
+        inFlipFlow -> null
+
+        state.objectMovedWarning ->
+            Guidance(stringResource(R.string.object_moved_warning), R.drawable.ic_surface, true)
+
         state.motionWarning ->
             Guidance(stringResource(R.string.warn_pure_rotation), R.drawable.ic_no_spin, true)
 
@@ -655,6 +694,205 @@ private fun CoverageGizmo(
                     textAlign = TextAlign.Center,
                     modifier = Modifier.clearAndSetSemantics {},
                 )
+            }
+        }
+    }
+}
+
+/**
+ * Top-start cluster for the two-pass flip flow: a "Two-sided scan" toggle while idle
+ * (so the user can opt in before recording), which becomes a live "Side N of 2" pass
+ * indicator once a two-pass scan is underway.
+ */
+@Composable
+private fun TopStartControls(
+    state: CaptureUiState,
+    onToggleTwoPass: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val phase = state.scanPhase
+    val inFlow = phase != ScanPhase.SinglePass
+    Box(modifier = modifier) {
+        if (inFlow && state.twoPassEnabled) {
+            // Live pass indicator.
+            val sideNumber = when (phase) {
+                ScanPhase.PassOne, ScanPhase.NeedsFlip -> 1
+                ScanPhase.Flipping, ScanPhase.ReadyForPassTwo, ScanPhase.PassTwo -> 2
+                ScanPhase.Complete -> 2
+                else -> 1
+            }
+            val label = stringResource(R.string.flip_pass_indicator, sideNumber)
+            Surface(
+                color = Color.Black.copy(alpha = 0.5f),
+                contentColor = Color.White,
+                shape = RoundedCornerShape(50),
+                modifier = Modifier.semantics { contentDescription = label },
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(7.dp),
+                    modifier = Modifier.padding(horizontal = 13.dp, vertical = 8.dp),
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_flip),
+                        contentDescription = null,
+                        tint = Color(0xFF8FC9FF),
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Text(
+                        text = label,
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.clearAndSetSemantics {},
+                    )
+                }
+            }
+        } else if (!state.isRecording && state.depthSupported) {
+            // Pre-record opt-in toggle.
+            val on = state.twoPassEnabled
+            val cd = stringResource(
+                if (on) R.string.twopass_disable_cd else R.string.twopass_enable_cd,
+            )
+            Surface(
+                color = if (on) Color(0xCC10324F) else Color.Black.copy(alpha = 0.42f),
+                contentColor = Color.White,
+                shape = RoundedCornerShape(50),
+                modifier = Modifier
+                    .clip(RoundedCornerShape(50))
+                    .clickable(
+                        role = Role.Switch,
+                        onClickLabel = cd,
+                        onClick = { onToggleTwoPass(!on) },
+                    )
+                    .semantics { contentDescription = cd },
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(7.dp),
+                    modifier = Modifier.padding(horizontal = 13.dp, vertical = 8.dp),
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_flip),
+                        contentDescription = null,
+                        tint = if (on) Color(0xFF8FC9FF) else Color.White.copy(alpha = 0.85f),
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Text(
+                        text = stringResource(R.string.twopass_label),
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.clearAndSetSemantics {},
+                    )
+                    // Simple on/off dot.
+                    Box(
+                        Modifier
+                            .size(9.dp)
+                            .clip(CircleShape)
+                            .drawBehind {
+                                drawCircle(if (on) Color(0xFF6BE675) else Color.White.copy(alpha = 0.3f))
+                            },
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * The prominent, can't-miss card that drives the two-pass flip sequence. It only shows
+ * during the flip phases and tells the user exactly what to do: flip the object, wait
+ * while it's detected moving, then scan side two — or that both sides are done. The
+ * three "needs flip / flipping / ready" states are detected automatically from depth.
+ */
+@Composable
+private fun FlipFlowBanner(
+    phase: ScanPhase,
+    modifier: Modifier = Modifier,
+) {
+    data class FlipCopy(val title: String, val body: String, val iconRes: Int, val accent: Color, val pulse: Boolean)
+
+    val copy: FlipCopy? = when (phase) {
+        ScanPhase.NeedsFlip -> FlipCopy(
+            stringResource(R.string.flip_needed_title),
+            stringResource(R.string.flip_needed_body),
+            R.drawable.ic_flip, Color(0xFFFFC074), pulse = true,
+        )
+        ScanPhase.Flipping -> FlipCopy(
+            stringResource(R.string.flip_inprogress_title),
+            stringResource(R.string.flip_inprogress_body),
+            R.drawable.ic_flip, Color(0xFF8FC9FF), pulse = true,
+        )
+        ScanPhase.ReadyForPassTwo -> FlipCopy(
+            stringResource(R.string.flip_ready_title),
+            stringResource(R.string.flip_ready_body),
+            R.drawable.ic_check, Color(0xFF6BE675), pulse = false,
+        )
+        ScanPhase.Complete -> FlipCopy(
+            stringResource(R.string.flip_complete_title),
+            stringResource(R.string.flip_complete_body),
+            R.drawable.ic_check, Color(0xFF6BE675), pulse = false,
+        )
+        else -> null
+    }
+
+    AnimatedVisibility(
+        visible = copy != null,
+        enter = fadeIn(tween(220)) + scaleIn(tween(220), initialScale = 0.9f),
+        exit = fadeOut(tween(160)) + scaleOut(tween(160), targetScale = 0.9f),
+        modifier = modifier,
+    ) {
+        val shown = remember(copy) { copy } ?: return@AnimatedVisibility
+        val pulseT = rememberInfiniteTransition(label = "flip-pulse")
+        val iconScale by pulseT.animateFloat(
+            initialValue = 1f,
+            targetValue = if (shown.pulse) 1.14f else 1f,
+            animationSpec = infiniteRepeatable(tween(620), RepeatMode.Reverse),
+            label = "flip-icon-scale",
+        )
+        Surface(
+            color = LanternNavy.copy(alpha = 0.95f),
+            contentColor = Color.White,
+            shape = RoundedCornerShape(24.dp),
+            shadowElevation = 12.dp,
+            modifier = Modifier
+                .widthIn(max = 420.dp)
+                .semantics {
+                    liveRegion = LiveRegionMode.Assertive
+                    contentDescription = "${shown.title}. ${shown.body}"
+                },
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                modifier = Modifier.padding(20.dp),
+            ) {
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .scale(if (shown.pulse) iconScale else 1f)
+                        .clip(CircleShape)
+                        .drawBehind { drawCircle(shown.accent.copy(alpha = 0.22f)) },
+                ) {
+                    Icon(
+                        painter = painterResource(shown.iconRes),
+                        contentDescription = null,
+                        tint = shown.accent,
+                        modifier = Modifier.size(26.dp),
+                    )
+                }
+                Column(modifier = Modifier.clearAndSetSemantics {}) {
+                    Text(
+                        text = shown.title,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        text = shown.body,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Color.White.copy(alpha = 0.82f),
+                    )
+                }
             }
         }
     }
