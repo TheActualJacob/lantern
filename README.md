@@ -38,7 +38,9 @@ Two depth sources by design: **DA-V2** gives a dense, smooth depth in unknown un
 
 ## Mesh cleanup — `import_and_clean.py`
 
-Takes the reconstruction's output mesh (`.glb`, also `.obj/.ply/.stl`) and produces a clean, CAD-ready `.glb`: import → join parts → voxel-remesh to watertight → consistent normals → scale m→mm → export. Returns a non-zero exit on failure so the pipeline can gate on it.
+Takes the reconstruction's output mesh (`.glb`, also `.obj/.ply/.stl`) and produces a clean mesh: import → join parts → voxel-remesh to watertight → consistent normals → scale m→mm → export. Writes **both** a `.glb` (for viewers/web) **and an `.stl`** beside it — CAD tools (Fusion 360, FreeCAD) can't read `.glb`, so the `.stl` is the actual CAD handoff. Returns a non-zero exit on failure so the pipeline can gate on it.
+
+Verify CAD-importability with `cad_check.py` (imports the STL through the OpenCASCADE kernel — FreeCAD's kernel — and reports *imports-as-mesh-body* and *solid-convertible*; needs `cadquery-ocp`).
 
 ```bash
 blender --background --python import_and_clean.py -- input.glb output.glb

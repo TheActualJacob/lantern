@@ -177,6 +177,19 @@ def main():
     bpy.ops.export_scene.gltf(filepath=out, export_format="GLB", use_selection=True)
     print(f"[lantern] OK -> {out}")
 
+    # Also emit an STL next to the GLB — .glb is a graphics format that CAD tools
+    # (Fusion 360, FreeCAD, SolidWorks) cannot import; STL is the universal mesh
+    # handoff for CAD. (Use Insert/Import Mesh, then mesh->solid if watertight.)
+    stl_out = os.path.splitext(out)[0] + ".stl"
+    try:
+        if hasattr(bpy.ops.wm, "stl_export"):       # Blender 4.x+
+            bpy.ops.wm.stl_export(filepath=stl_out, export_selected_objects=True)
+        else:                                        # older Blender
+            bpy.ops.export_mesh.stl(filepath=stl_out, use_selection=True)
+        print(f"[lantern] CAD STL -> {stl_out}")
+    except Exception as exc:
+        print(f"[lantern] WARN: STL export failed ({exc}); GLB still written", file=sys.stderr)
+
 
 if __name__ == "__main__":
     try:
