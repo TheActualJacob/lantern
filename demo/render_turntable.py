@@ -108,6 +108,17 @@ def make_material(obj, clay):
     obj.data.materials.append(mat)
 
 
+def world_bsphere(obj):
+    """World-space bounding-box center and bounding-sphere radius."""
+    corners = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+    cx = sum(c.x for c in corners) / 8.0
+    cy = sum(c.y for c in corners) / 8.0
+    cz = sum(c.z for c in corners) / 8.0
+    center = Vector((cx, cy, cz))
+    radius = max((c - center).length for c in corners) or 1.0
+    return center, radius
+
+
 def build_studio(res, frames):
     scene = bpy.context.scene
     # neutral studio world
@@ -130,18 +141,6 @@ def build_studio(res, frames):
         light.data.energy = energy
         light.data.size = 5
 
-    # camera with track-to constraint on origin
-    target = bpy.data.objects.new("target", None)
-    bpy.context.collection.objects.link(target)
-    target.location = (0, 0, 1.0)
-    bpy.ops.object.camera_add(location=(0, -6, 3.5))
-    cam = bpy.context.active_object
-    con = cam.constraints.new("TRACK_TO")
-    con.target = target
-    con.track_axis = "TRACK_NEGATIVE_Z"
-    con.up_axis = "UP_Y"
-    scene.camera = cam
-
     # render settings
     scene.render.resolution_x, scene.render.resolution_y = res
     scene.render.fps = 30
@@ -152,6 +151,49 @@ def build_studio(res, frames):
         except TypeError:
             continue
 
+    # ambient occlusion / contact shadows for depth — property names churn across
+    # EEVEE versions, so set whatever exists and ignore the rest.
+    ee = getattr(scene, "eevee", None)
+    for attr in ("use_gtao", "use_raytracing", "use_fast_gi"):
+        if ee is not None and hasattr(ee, attr):
+            try:
+                setattr(ee, attr, True)
+            except Exception:
+                pass
+
+
+def fit_camera(obj, res):
+    """Frame the object to fill the view, regardless of its shape/scale.
+
+    Distance is derived from the object's bounding-sphere radius and the camera's
+    field of view (using the tighter of horizontal/vertical for the aspect ratio),
+    so a thin sliver and a fat blob both fill the frame consistently.
+    """
+    scene = bpy.context.scene
+    center, radius = world_bsphere(obj)
+
+    target = bpy.data.objects.new("target", None)
+    bpy.context.collection.objects.link(target)
+    target.location = center
+
+    bpy.ops.object.camera_add()
+    cam = bpy.context.active_object
+    cam.data.lens = 50.0
+    sensor = cam.data.sensor_width  # 36 mm default
+    hfov = 2.0 * math.atan(sensor / (2.0 * cam.data.lens))
+    vfov = 2.0 * math.atan((sensor * res[1] / res[0]) / (2.0 * cam.data.lens))
+    fov = min(hfov, vfov)
+    dist = radius / math.sin(fov / 2.0) * 1.25  # 1.25 = breathing room
+
+    el = math.radians(22.0)  # gentle downward look
+    cam.location = center + Vector((0.0, -math.cos(el), math.sin(el))) * dist
+
+    con = cam.constraints.new("TRACK_TO")
+    con.target = target
+    con.track_axis = "TRACK_NEGATIVE_Z"
+    con.up_axis = "UP_Y"
+    scene.camera = cam
+
 
 def main():
     mesh, out_dir, frames, res, clay = parse(args_after_dashes())
@@ -160,7 +202,21 @@ def main():
     obj = import_mesh(mesh)
     center_and_normalize(obj)
     make_material(obj, clay)
+
+    # smooth shading hides voxel-remesh faceting; auto-smooth keeps genuine hard
+    # edges where present (operator name varies by Blender version).
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    if hasattr(bpy.ops.object, "shade_auto_smooth"):
+        try:
+            bpy.ops.object.shade_auto_smooth(angle=math.radians(35))
+        except Exception:
+            bpy.ops.object.shade_smooth()
+    else:
+        bpy.ops.object.shade_smooth()
+
     build_studio(res, frames)
+    fit_camera(obj, res)
 
     os.makedirs(out_dir, exist_ok=True)
     scene = bpy.context.scene
