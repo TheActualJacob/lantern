@@ -36,6 +36,8 @@ name, or initials + what you're on). Times in local PDT.
 
 | Finished | Session | Task | Result |
 |---|---|---|---|
+| 2026-06-27 ~15:30 | S-personD-integration | Demo reel (video) scaffolding | `demo/` added: `render_turntable.py` (Blender turntable PNGs), `build_reel.py` (assembles reel.mp4 w/ placeholder slots — bundled ffmpeg), `STORYBOARD.md`, `README.md`. Full reel builds end-to-end from the real S25 scan. Humans still owe: live-scan screen-record + CAD-import screen-record. |
+| 2026-06-27 ~15:10 | S-personD-integration | CAD-import verification | `cad_check.py` (OpenCASCADE kernel import) + STL export in `import_and_clean.py`; pushed `9bcb9c5`. Closed object solid-convertible; real scan imports as mesh body. |
 | 2026-06-27 ~14:30 | S-personD-integration | Ground-truth validator (Phase 3c) + env + integration | `ground_truth.py` pushed; reference mode (FPFH+RANSAC→ICP, color `.ply` + histogram) & known-dims mode; `--selftest` PASSED (sphere +2%≈2 mm, align recovery 0.000 mm). `requirements.txt` pushed (open3d≥0.19). Verified Sneha's pipeline end-to-end on py3.12. **Note:** built as `ground_truth.py` (not `ground_truth_report.py`) — claim above trimmed to avoid dup. |
 | 2026-06-27 ~13:50 | S-vault-personD | On-device mesh cleanup prototype | `clean_ondevice.py` added; `--selftest` PASSED (sphere → 200.0 mm; Poisson path runs) |
 | 2026-06-27 ~13:50 | S-vault-personD | Win plan + pitch outline + 5-min Claude Design prompt | written to vault `projects/executorch-hackathon/` |

@@ -68,3 +68,8 @@ logs/
 
 # Raw pulled device sessions (converted form lives in real_session/)
 pulled_sessions/
+
+# demo reel rendered output (keep scripts, not footage)
+*.mp4
+demo/assets/
+demo/frames/
