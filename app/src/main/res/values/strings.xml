@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">Lantern Recorder</string>
+    <string name="status_initializing">Initializing AR session…</string>
+    <string name="depth_supported">RAW_DEPTH_ONLY supported: %1$s</string>
+    <string name="camera_permission_needed">Camera permission is required for AR capture.</string>
+    <string name="record_start">● Record</string>
+    <string name="record_stop">■ Stop</string>
+    <string name="recording_status">REC ● %1$s — %2$d frames</string>
+    <string name="depth_unsupported_no_record">Raw depth unsupported — recording disabled.</string>
+</resources>

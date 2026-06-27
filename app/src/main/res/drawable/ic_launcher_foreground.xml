@@ -1,0 +1,19 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Simple "lantern" glyph centered in the adaptive icon safe zone. -->
+    <path
+        android:fillColor="#FFC861"
+        android:pathData="M54,30 L66,42 L66,66 L42,66 L42,42 Z" />
+    <path
+        android:fillColor="#FFE3A3"
+        android:pathData="M50,30 h8 v4 h-8 z" />
+    <path
+        android:fillColor="#FFC861"
+        android:pathData="M52,24 h4 v6 h-4 z" />
+    <path
+        android:fillColor="#0B1F33"
+        android:pathData="M48,46 h12 v16 h-12 z" />
+</vector>
