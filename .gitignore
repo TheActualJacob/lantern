@@ -65,3 +65,6 @@ disparities/
 # Logs
 *.log
 logs/
+
+# Raw pulled device sessions (converted form lives in real_session/)
+pulled_sessions/

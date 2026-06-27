@@ -47,6 +47,9 @@ class FrameRecorder(private val context: Context) {
     private val ioExecutor = Executors.newSingleThreadExecutor()
     private val savedCount = AtomicInteger(0)
 
+    // Logs the real camera intrinsics exactly once per session (first saved frame).
+    private val loggedIntrinsics = java.util.concurrent.atomic.AtomicBoolean(false)
+
     // Throttle status spam from the per-frame GL loop.
     private var lastStatus = ""
     private var lastStatusMs = 0L
@@ -75,6 +78,7 @@ class FrameRecorder(private val context: Context) {
         sessionDir = dir
         savedCount.set(0)
         hasLastSaved = false
+        loggedIntrinsics.set(false)
         recording = true
         Log.i(TAG, "Recording started → ${dir.absolutePath}")
         return dir.name
@@ -186,6 +190,20 @@ class FrameRecorder(private val context: Context) {
     private fun writeFrame(dir: File, f: CapturedFrame) {
         val id = "%04d".format(f.index)
         try {
+            // One-time sanity log: the real on-device camera intrinsics + image sizes.
+            // Lets you eyeball the actual S25 focal length in logcat before pulling the
+            // session, instead of guessing fx in the host pipeline. ARCore reports these
+            // for the full CPU image (intrinsics width/height) — the host converter
+            // rescales them to the saved depth resolution.
+            if (loggedIntrinsics.compareAndSet(false, true)) {
+                Log.i(
+                    TAG,
+                    "Intrinsics (full CPU image): fx=${f.focalLength[0]} fy=${f.focalLength[1]} " +
+                        "cx=${f.principalPoint[0]} cy=${f.principalPoint[1]} " +
+                        "size=${f.intrinsicsDimensions[0]}x${f.intrinsicsDimensions[1]} | " +
+                        "saved rgb=${f.rgb.width}x${f.rgb.height} depth=${f.depth.width}x${f.depth.height}",
+                )
+            }
             // RGB → 8-bit PNG via Bitmap.
             val bitmap = Bitmap.createBitmap(f.rgb.argb, f.rgb.width, f.rgb.height, Bitmap.Config.ARGB_8888)
             FileOutputStream(File(dir, "frame_$id.png")).use { out ->
