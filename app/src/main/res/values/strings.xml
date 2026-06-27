@@ -6,5 +6,6 @@
     <string name="record_start">● Record</string>
     <string name="record_stop">■ Stop</string>
     <string name="recording_status">REC ● %1$s — %2$d frames</string>
+    <string name="recording_saved">Saved %1$d frames → %2$s</string>
     <string name="depth_unsupported_no_record">Raw depth unsupported — recording disabled.</string>
 </resources>

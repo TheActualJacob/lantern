@@ -40,8 +40,16 @@ class FrameRecorder(private val context: Context) {
     @Volatile
     var onFrameSaved: ((index: Int, sessionName: String) -> Unit)? = null
 
+    /** Invoked while recording with a short, human-readable status (why we are / aren't saving). */
+    @Volatile
+    var onStatus: ((message: String) -> Unit)? = null
+
     private val ioExecutor = Executors.newSingleThreadExecutor()
     private val savedCount = AtomicInteger(0)
+
+    // Throttle status spam from the per-frame GL loop.
+    private var lastStatus = ""
+    private var lastStatusMs = 0L
 
     @Volatile
     private var recording = false
@@ -57,6 +65,8 @@ class FrameRecorder(private val context: Context) {
 
     val isRecording: Boolean get() = recording
     val sessionName: String? get() = sessionDir?.name
+    val savedFrameCount: Int get() = savedCount.get()
+    val sessionPath: String? get() = sessionDir?.absolutePath
 
     fun start(): String {
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
@@ -84,6 +94,16 @@ class FrameRecorder(private val context: Context) {
     private fun sessionsRoot(): File =
         File(context.getExternalFilesDir(null), "sessions").apply { mkdirs() }
 
+    /** Logs + surfaces a status message, throttled so the GL loop can't spam it. */
+    private fun reportStatus(message: String) {
+        val now = System.currentTimeMillis()
+        if (message == lastStatus && now - lastStatusMs < 1000L) return
+        lastStatus = message
+        lastStatusMs = now
+        Log.d(TAG, message)
+        onStatus?.invoke(message)
+    }
+
     /**
      * Called every render frame on the GL thread. Saves the frame if the camera has
      * moved past the translation threshold and all required images are available.
@@ -91,7 +111,10 @@ class FrameRecorder(private val context: Context) {
     fun onFrame(frame: Frame) {
         if (!recording) return
         val camera = frame.camera
-        if (camera.trackingState != TrackingState.TRACKING) return
+        if (camera.trackingState != TrackingState.TRACKING) {
+            reportStatus("Move the phone slowly — waiting for tracking (${camera.trackingState})")
+            return
+        }
 
         val pose = camera.pose
         val x = pose.tx()
@@ -113,10 +136,13 @@ class FrameRecorder(private val context: Context) {
             capture(frame, index)
         } catch (e: NotYetAvailableException) {
             // Camera image or depth not ready yet this frame — retry next frame
-            // without advancing the counter or the last-saved position.
+            // without advancing the counter or the last-saved position. Raw depth
+            // needs translational motion, so this is common until the phone moves.
+            reportStatus("Keep moving — waiting for raw depth…")
             return
         } catch (e: Exception) {
             Log.e(TAG, "Capture failed for frame $index", e)
+            reportStatus("Capture error: ${e.message}")
             return
         }
 
@@ -180,6 +206,7 @@ class FrameRecorder(private val context: Context) {
             // Metadata JSON.
             writeJson(File(dir, "frame_$id.json"), f)
 
+            Log.i(TAG, "Saved frame $id (${f.rgb.width}x${f.rgb.height} rgb, ${f.depth.width}x${f.depth.height} depth)")
             onFrameSaved?.invoke(f.index, dir.name)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to write frame ${f.index}", e)

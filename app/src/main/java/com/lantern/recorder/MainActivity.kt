@@ -67,6 +67,10 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 binding.statusText.text = getString(R.string.recording_status, sessionName, index)
             }
         }
+        frameRecorder.onStatus = { message ->
+            // Only show diagnostics while recording; ignore once frames are flowing.
+            if (frameRecorder.isRecording) runOnUiThread { binding.statusText.text = message }
+        }
         binding.recordButton.setOnClickListener { toggleRecording() }
     }
 
@@ -76,10 +80,14 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             return
         }
         if (frameRecorder.isRecording) {
+            val name = frameRecorder.sessionName ?: "—"
+            val count = frameRecorder.savedFrameCount
             frameRecorder.stop()
             binding.recordButton.setText(R.string.record_start)
-            binding.statusText.text =
-                getString(R.string.depth_supported, rawDepthSupported.toString())
+            val summary = getString(R.string.recording_saved, count, name)
+            binding.statusText.text = summary
+            Toast.makeText(this, summary, Toast.LENGTH_LONG).show()
+            Log.i(TAG, "Saved to ${frameRecorder.sessionPath}")
         } else {
             val name = frameRecorder.start()
             binding.recordButton.setText(R.string.record_stop)

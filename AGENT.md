@@ -86,6 +86,27 @@ enabled when `RAW_DEPTH_ONLY` is supported, and auto-stops on `onPause`.
 
 Bump versions in `gradle/libs.versions.toml` (single source of truth).
 
+## Getting data off the device + converting to pipeline input
+
+The recorder writes to app-private external storage (no on-device viewer — it's a
+capture harness). Pull a session and convert it to the float-pipeline layout:
+
+```sh
+adb pull /sdcard/Android/data/com.lantern.recorder/files/sessions ./sessions
+python3 convert_session.py ./sessions/session_<stamp>     # → ./session_<stamp>_dataset/{frames,arcore}/
+```
+
+`convert_session.py` bridges the recorder's flat session (`frame_NNNN.png`,
+`depth_NNNN.png`, `conf_NNNN.png`, `frame_NNNN.json`) to what `pipeline_float.py`
+expects (`frames/<base>.color.png`, `arcore/<base>.depth.png`, `<base>.pose.txt`,
+`intrinsics.txt`). It transposes the pose from ARCore's column-major (OpenGL)
+matrix to the row-major form `np.loadtxt` reads, and copies PNGs byte-for-byte so
+16-bit depth stays lossless. Emitted `intrinsics.txt` is the **color-image**
+intrinsics; the disparity/calibration step (the AI part) owns resizing the
+lower-res raw depth to the disparity resolution (`solve_affine` needs matching
+shapes). The DA-V2 `disparities/` input is produced separately and is out of scope
+for this recorder.
+
 ## Prerequisites to build/run
 
 - **Android Studio** (recent; bundles a JDK 17 and SDK manager). The system JDK on
