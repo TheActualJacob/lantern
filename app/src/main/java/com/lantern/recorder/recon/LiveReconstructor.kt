@@ -70,9 +70,13 @@ class LiveReconstructor(
     private enum class LockState { SEARCHING, LOCKED }
     @Volatile private var lockState = LockState.SEARCHING
 
-    // Warmup candidate (SEARCHING): the object distance we're waiting to confirm, and since when.
+    // Warmup candidate (SEARCHING): the object distance we're building evidence for, the accumulated
+    // on-object evidence (ms), and the timestamp of the last warmup frame. Evidence grows on
+    // consistent frames and erodes slowly on others, so a frequently-locked area — even one that
+    // comes in and out — accumulates and locks, while a rare distractor never unseats it.
     private var warmupDepth: Float? = null
-    private var warmupSinceNs = 0L
+    private var warmupScoreMs = 0f
+    private var lastWarmupNs = 0L
 
     // The locked object's established distance (LOCKED), tracked as an EMA over consistent frames.
     private var lockedDepth: Float? = null
@@ -110,7 +114,8 @@ class LiveReconstructor(
             reanchorStreak = 0
             lockState = LockState.SEARCHING
             warmupDepth = null
-            warmupSinceNs = 0L
+            warmupScoreMs = 0f
+            lastWarmupNs = 0L
             lockedDepth = null
             lastOnLockNs = 0L
             meshRef.set(MeshData.EMPTY)
@@ -270,21 +275,41 @@ class LiveReconstructor(
         val now = System.nanoTime()
         when (lockState) {
             LockState.SEARCHING -> {
-                // Warm up: require FastSAM to hold one object at a steady distance for
-                // WARMUP_LOCK_MS before committing. Nothing fuses here, so the mesh starts clean.
+                // Warm up by accumulating evidence for one area before committing. Nothing fuses
+                // here, so the mesh starts clean. Evidence persists across in/out gaps, so an area
+                // FastSAM locks onto frequently wins even if it flickers.
                 if (maskDepth == null || centroid == null) return
+                // Per-frame credit, capped so a long gap (object out of view) can't dump evidence.
+                val dtMs = if (lastWarmupNs == 0L) 0f
+                    else ((now - lastWarmupNs) / 1_000_000f).coerceAtMost(WARMUP_DT_CAP_MS)
+                lastWarmupNs = now
                 val cand = warmupDepth
-                if (cand == null || kotlin.math.abs(maskDepth - cand) / cand > LOCK_DEPTH_TOL) {
-                    warmupDepth = maskDepth
-                    warmupSinceNs = now
-                } else {
-                    warmupDepth = cand + LOCK_DEPTH_EMA_ALPHA * (maskDepth - cand)
-                    if (now - warmupSinceNs >= WARMUP_LOCK_MS * 1_000_000L) {
-                        volume.centerOn(centroid[0], centroid[1], centroid[2])
-                        lockedDepth = warmupDepth
-                        integratedFrames = 0
-                        lastOnLockNs = now
-                        lockState = LockState.LOCKED
+                when {
+                    cand == null -> {
+                        warmupDepth = maskDepth
+                        warmupScoreMs = 0f
+                    }
+                    kotlin.math.abs(maskDepth - cand) / cand <= LOCK_DEPTH_TOL -> {
+                        // Same area: reinforce and lock once enough evidence has accumulated.
+                        warmupDepth = cand + LOCK_DEPTH_EMA_ALPHA * (maskDepth - cand)
+                        warmupScoreMs += dtMs
+                        if (warmupScoreMs >= WARMUP_LOCK_MS) {
+                            volume.centerOn(centroid[0], centroid[1], centroid[2])
+                            lockedDepth = warmupDepth
+                            integratedFrames = 0
+                            lastOnLockNs = now
+                            lockState = LockState.LOCKED
+                        }
+                    }
+                    else -> {
+                        // A different area: erode the candidate's evidence slowly instead of
+                        // resetting, so a rare distractor can't unseat a frequently-seen object.
+                        // Adopt the newcomer only once the old candidate's evidence is fully spent.
+                        warmupScoreMs -= dtMs * WARMUP_DECAY
+                        if (warmupScoreMs <= 0f) {
+                            warmupDepth = maskDepth
+                            warmupScoreMs = 0f
+                        }
                     }
                 }
             }
@@ -318,7 +343,8 @@ class LiveReconstructor(
         integratedFrames = 0
         lockState = LockState.SEARCHING
         warmupDepth = null
-        warmupSinceNs = 0L
+        warmupScoreMs = 0f
+        lastWarmupNs = 0L
         lockedDepth = null
         lastOnLockNs = 0L
     }
@@ -383,7 +409,11 @@ class LiveReconstructor(
             append("objFound=${mask != null}  maskCov=${"%.1f".format(coverage * 100)}%\n")
             append("focusDepth=${focusDepth?.let { "%.2fm".format(it) } ?: "—"}  ")
             append("ground=${lastGroundPlaneY?.let { "%.2f".format(it) } ?: "—"}\n")
-            append("lock=$lockState  lockDepth=${lockedDepth?.let { "%.2fm".format(it) } ?: "—"}\n")
+            if (lockState == LockState.SEARCHING) {
+                append("lock=SEARCHING  warmup=${(100f * warmupScoreMs / WARMUP_LOCK_MS).toInt()}%\n")
+            } else {
+                append("lock=LOCKED  lockDepth=${lockedDepth?.let { "%.2fm".format(it) } ?: "—"}\n")
+            }
             append("centered=${volume.isCentered}  frames=$integratedFrames\n")
             append("depth=${w}x$h  argb=${argb.width}x${argb.height}")
         }
@@ -475,8 +505,13 @@ class LiveReconstructor(
         private const val MASK_DEPTH_TOL = 0.25f
 
         // Object-lock state machine (segmentation mode):
-        // Warmup: FastSAM must hold one object at a steady distance this long before anything fuses.
-        private const val WARMUP_LOCK_MS = 5_000L
+        // Warmup: accumulated on-object evidence (ms) needed before anything fuses. Because evidence
+        // persists across in/out gaps, a frequently-locked area reaches this even if it flickers.
+        private const val WARMUP_LOCK_MS = 2_000f
+        // How fast a competing area erodes the current candidate's evidence (x per-frame dt).
+        private const val WARMUP_DECAY = 1.0f
+        // Cap on a single frame's evidence credit, so a long out-of-view gap can't dump score.
+        private const val WARMUP_DT_CAP_MS = 300f
         // Unlock: once we've been off the locked object this long, the lock was wrong (or the object
         // left) — tear the mesh down and re-search, so a bad (e.g. floor) lock can't live forever.
         private const val UNLOCK_MS = 3_000L
