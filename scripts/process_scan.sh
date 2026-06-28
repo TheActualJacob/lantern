@@ -18,6 +18,8 @@
 #   --known-dims WxHxD   caliper dims (mm) -> runs ground_truth known-dims mode
 #   --reference FILE     reference scan (e.g. iPad LiDAR) -> ground_truth reference mode
 #   --adb-pull          pull the newest .obj from the app's models/ dir via adb, then process
+#   --cuboid            also fit a clean cuboid (demo post-process for boxy objects);
+#                       the hero render then uses the cuboid. Does not affect CAD/accuracy.
 #   --no-hero           skip the turntable render
 #   --frames N          hero frames (default 60)
 #   --res WxH           hero resolution (default 1920x1080)
@@ -34,7 +36,7 @@ elif [ -x "/Applications/Blender.app/Contents/MacOS/Blender" ]; then BLENDER="/A
 else echo "ERROR: Blender not found"; exit 1; fi
 
 # --- defaults / args ------------------------------------------------------
-MESH=""; OUT=""; VOXEL="0.003"; KNOWN=""; REF=""; ADB_PULL=0; HERO=1; FRAMES=60; RES="1920x1080"
+MESH=""; OUT=""; VOXEL="0.003"; KNOWN=""; REF=""; ADB_PULL=0; HERO=1; FRAMES=60; RES="1920x1080"; CUBOID=0
 APP_MODELS="/sdcard/Android/data/com.lantern.recorder/files/models"
 
 while [ $# -gt 0 ]; do
@@ -47,6 +49,7 @@ while [ $# -gt 0 ]; do
     --no-hero) HERO=0; shift;;
     --frames) FRAMES="$2"; shift 2;;
     --res) RES="$2"; shift 2;;
+    --cuboid) CUBOID=1; shift;;
     --*) echo "unknown option $1"; exit 1;;
     *) MESH="$1"; shift;;
   esac
@@ -98,10 +101,21 @@ else
   echo "  (skip: pass --known-dims WxHxD or --reference FILE for a real accuracy number)"
 fi
 
+# --- 3.5 optional cuboid fit (demo post-process for boxy objects) ---------
+# Standalone — does not alter the clean mesh / CAD / accuracy above; just an
+# extra demo-quality artifact. When set, the hero renders the cuboid.
+HERO_SRC="$CLEAN"
+CUBOID_GLB="$OUT/${NAME}_cuboid.glb"
+if [ "$CUBOID" = "1" ]; then
+  echo "[scan] 3.5 cuboid fit ..."
+  "$PY" cuboid_fit.py "$CLEAN" --out "$CUBOID_GLB" 2>&1 | grep -E "^\[cuboid\]" || true
+  [ -f "$CUBOID_GLB" ] && HERO_SRC="$CUBOID_GLB"
+fi
+
 # --- 4. hero turntable ----------------------------------------------------
 if [ "$HERO" = "1" ]; then
-  echo "[scan] 4/4 hero turntable ($RES, $FRAMES frames) ..."
-  "$BLENDER" --background --python demo/render_turntable.py -- "$CLEAN" "$OUT/hero_frames" --frames "$FRAMES" --res "$RES" 2>&1 | grep -E "turntable done" || true
+  echo "[scan] 4/4 hero turntable ($RES, $FRAMES frames) src=$(basename "$HERO_SRC") ..."
+  "$BLENDER" --background --python demo/render_turntable.py -- "$HERO_SRC" "$OUT/hero_frames" --frames "$FRAMES" --res "$RES" 2>&1 | grep -E "turntable done" || true
   FF="$("$PY" -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())" 2>/dev/null || true)"
   if [ -n "$FF" ] && ls "$OUT/hero_frames"/frame_*.png >/dev/null 2>&1; then
     "$FF" -y -hide_banner -loglevel error -framerate 30 -i "$OUT/hero_frames/frame_%04d.png" \
@@ -116,6 +130,7 @@ echo "=============================================================="
 echo "[scan] DONE -> $OUT"
 echo "  clean mesh : $CLEAN"
 echo "  CAD STL    : $STL"
+[ -f "$CUBOID_GLB" ] && echo "  cuboid     : $CUBOID_GLB"
 [ -f "$OUT/ground_truth_report.txt" ] && echo "  accuracy   : $OUT/ground_truth_report.txt"
 [ -f "$OUT/hero.mp4" ] && echo "  hero clip  : $OUT/hero.mp4"
 echo "=============================================================="
