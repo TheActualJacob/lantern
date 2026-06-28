@@ -28,9 +28,18 @@ class LiveReconstructor(
     qnnModelPath: String? = null,
     nativeLibDir: String? = null,
     segModelPath: String? = null,
+    private val mvModelPath: String? = null,
 ) {
     private val volume = TsdfVolume()
     private val arcoreDepth = ArCoreRawDepthSource()
+
+    /**
+     * Multi-view DA3 backend for the directed *build* (not live). Loaded lazily on first build so
+     * its ~100 MB `.pte` doesn't add to startup; the live path never touches it. Null if no
+     * multi-view `.pte` is present — directed build then uses the mono per-frame path.
+     */
+    @Volatile private var multiView: Da3MultiViewModel? = null
+    @Volatile private var multiViewLoaded = false
 
     /**
      * Dense-depth backend. Preference order: native QNN DLC (Hexagon NPU) -> ExecuTorch `.pte`
@@ -144,7 +153,15 @@ class LiveReconstructor(
      * ~100 MB DA3 load and a second QNN/NPU context (which would contend with the live segmenter).
      * Call only when live fusion is stopped (directed mode), so the models aren't used concurrently.
      */
-    fun newBatchReconstructor(): BatchReconstructor = BatchReconstructor(depth, seg)
+    fun newBatchReconstructor(): BatchReconstructor {
+        // Lazy-load the multi-view model on first build (directed mode only), so its weight load
+        // never delays startup or the live segmenter. Cached for subsequent builds.
+        if (!multiViewLoaded) {
+            multiViewLoaded = true
+            multiView = mvModelPath?.let { Da3MultiViewModel.loadOrNull(it) }
+        }
+        return BatchReconstructor(depth, seg, multiView)
+    }
 
     /**
      * Run FastSAM once on [argb], returning the object mask at [outW]x[outH] (1=object, 0=background)
@@ -699,7 +716,7 @@ class LiveReconstructor(
     fun close() {
         running = false
         worker.execute { seg?.close() }
-        fusionWorker.execute { depth?.close() }
+        fusionWorker.execute { depth?.close(); multiView?.close() }
         worker.shutdown()
         fusionWorker.shutdown()
     }

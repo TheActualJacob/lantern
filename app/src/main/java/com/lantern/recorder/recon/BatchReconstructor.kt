@@ -34,6 +34,7 @@ private const val TAG = "LANTERN"
 class BatchReconstructor(
     private val depth: DepthBackend?,
     private val seg: QnnSegmentationModel?,
+    private val multiView: Da3MultiViewModel? = null,
 ) {
     /** A captured viewpoint, held in memory (no 16-bit-PNG round-trip). */
     class Keyframe(
@@ -68,6 +69,19 @@ class BatchReconstructor(
      * frames, or no object could be located. Safe to call once; create a fresh instance per build.
      */
     fun reconstruct(frames: List<Keyframe>, progress: Progress? = null): MeshData {
+        // Preferred path: native multi-view DA3 (one joint solve -> consistent geometry). Falls
+        // through to the mono per-frame path below if the model is absent or it can't build.
+        if (multiView != null && seg != null && frames.isNotEmpty()) {
+            val mv = try {
+                reconstructMultiView(frames, progress)
+            } catch (t: Throwable) {
+                Log.e(TAG, "BatchReconstructor: multi-view path failed; falling back to mono", t)
+                MeshData.EMPTY
+            }
+            if (!mv.isEmpty) return mv
+            Log.w(TAG, "BatchReconstructor: multi-view produced no mesh; trying mono fallback")
+        }
+
         val da3 = depth
         if (da3 == null) {
             Log.w(TAG, "BatchReconstructor: no depth backend; cannot build")
@@ -207,6 +221,136 @@ class BatchReconstructor(
         return MeshData(v, normals, IntArray(0))
     }
 
+    /**
+     * Native multi-view reconstruction: one [Da3MultiViewModel] forward over the model's fixed
+     * number of selected keyframes yields per-view depth + DA3-estimated poses/intrinsics in **one
+     * shared frame**, so
+     * back-projecting them merges into a coherent object (no affine fit, no ARCore-pose stitching —
+     * DA3 supplies the geometry). The SAM mask per view isolates the object; confidence + the shared
+     * density filter clean it. Returns [MeshData.EMPTY] if the model output is unusable.
+     *
+     * Scale note: DA3 depth is up-to-scale in its own frame; the result is metrically *arbitrary*
+     * (the viewer normalizes by extent). A future pass can fit one global factor vs ARCore depth.
+     */
+    private fun reconstructMultiView(frames: List<Keyframe>, progress: Progress?): MeshData {
+        val mv = multiView ?: return MeshData.EMPTY
+        @Suppress("NAME_SHADOWING") val seg = seg ?: return MeshData.EMPTY
+        val n = mv.numViews
+        val res = mv.res
+        progress?.update(0, 1, "Selecting views…")
+        val views = selectViews(frames, n)
+
+        progress?.update(0, 1, "Multi-view depth…")
+        val result = mv.infer(views.map { it.argb }) ?: return MeshData.EMPTY
+
+        // SAM mask per view, sampled into the same res x res letterboxed grid as the depth.
+        progress?.update(0, 1, "Masking…")
+        val masks = ArrayList<FloatArray>(n)
+        for (i in 0 until n) {
+            val g = result.geom[i]
+            val content = seg.inferObjectMask(views[i].argb, g.newW, g.newH) // 1=object over the image
+            masks.add(placeInSquare(content, g, res))
+        }
+
+        // Back-project every masked, confident pixel of each view with that view's K + extrinsics.
+        val seen = HashSet<Long>(1 shl 16)
+        val verts = ArrayList<Float>(1 shl 16)
+        val vertKeys = ArrayList<Long>(1 shl 16)
+        val plane = res * res
+        val xc = FloatArray(3)
+        val xw = FloatArray(3)
+        outer@ for (i in 0 until n) {
+            progress?.update(i, n, "Fusing ${i + 1}/$n")
+            val dBase = i * plane
+            val mask = masks[i]
+            // Per-view confidence gate: drop the lowest [CONF_DROP_PCT] of masked pixels (edges/holes).
+            val confThr = maskedConfPercentile(result.conf, dBase, mask, CONF_DROP_PCT)
+            val fx = result.intrinsics[i * 9 + 0]
+            val fy = result.intrinsics[i * 9 + 4]
+            val cx = result.intrinsics[i * 9 + 2]
+            val cy = result.intrinsics[i * 9 + 5]
+            val e = i * 12 // 3x4 row-major world->cam [R|t]
+            for (idx in 0 until plane) {
+                if (mask[idx] < 0.5f) continue
+                val z = result.depth[dBase + idx]
+                if (z <= 0f || !z.isFinite()) continue
+                if (result.conf[dBase + idx] < confThr) continue
+                val u = idx % res
+                val v = idx / res
+                xc[0] = (u - cx) / fx * z
+                xc[1] = (v - cy) / fy * z
+                xc[2] = z
+                worldFromCam(result.extrinsics, e, xc, xw) // Xw = R^T (Xc - t)
+                val key = voxelKey(xw[0], xw[1], xw[2])
+                if (seen.add(key)) {
+                    verts.add(xw[0]); verts.add(xw[1]); verts.add(xw[2])
+                    vertKeys.add(key)
+                    if (verts.size / 3 >= MAX_POINTS) break@outer
+                }
+            }
+        }
+        if (verts.size / 3 < MIN_POINTS) {
+            Log.w(TAG, "BatchReconstructor(MV): too few points (${verts.size / 3})")
+            return MeshData.EMPTY
+        }
+        val v = densityFilter(verts, vertKeys, seen)
+        if (v.size / 3 < MIN_POINTS) {
+            Log.w(TAG, "BatchReconstructor(MV): too few points after density filter (${v.size / 3})")
+            return MeshData.EMPTY
+        }
+        progress?.update(1, 1, "Finishing…")
+        val normals = FloatArray(v.size) { if (it % 3 == 1) 1f else 0f }
+        Log.i(TAG, "BatchReconstructor(MV): point cloud ${v.size / 3} points from $n views")
+        return MeshData(v, normals, IntArray(0))
+    }
+
+    /** Pick exactly [n] keyframes: even spread if more were captured, cyclic pad if fewer. */
+    private fun selectViews(frames: List<Keyframe>, n: Int): List<Keyframe> {
+        if (frames.size == n) return frames
+        val out = ArrayList<Keyframe>(n)
+        if (frames.size > n) {
+            for (i in 0 until n) {
+                val idx = Math.round(i.toFloat() * (frames.size - 1) / (n - 1)).coerceIn(0, frames.size - 1)
+                out.add(frames[idx])
+            }
+        } else {
+            for (i in 0 until n) out.add(frames[i % frames.size]) // pad by repetition
+        }
+        return out
+    }
+
+    /** Place a [content]-sized (newW x newH) mask into the padded [res] square at the view's offset. */
+    private fun placeInSquare(content: FloatArray?, g: Da3MultiViewModel.ViewGeom, res: Int): FloatArray {
+        val out = FloatArray(res * res)
+        if (content == null) return out
+        for (oy in 0 until g.newH) {
+            val dstRow = (g.padY + oy) * res + g.padX
+            val srcRow = oy * g.newW
+            for (ox in 0 until g.newW) out[dstRow + ox] = content[srcRow + ox]
+        }
+        return out
+    }
+
+    /** Xw = R^T (Xc - t) for a 3x4 row-major world->cam `[R|t]` at offset [e] in [ext]. */
+    private fun worldFromCam(ext: FloatArray, e: Int, xc: FloatArray, out: FloatArray) {
+        val dx = xc[0] - ext[e + 3]
+        val dy = xc[1] - ext[e + 7]
+        val dz = xc[2] - ext[e + 11]
+        // R rows are (e0,e1,e2),(e4,e5,e6),(e8,e9,e10); R^T multiply = columns dotted with d.
+        out[0] = ext[e + 0] * dx + ext[e + 4] * dy + ext[e + 8] * dz
+        out[1] = ext[e + 1] * dx + ext[e + 5] * dy + ext[e + 9] * dz
+        out[2] = ext[e + 2] * dx + ext[e + 6] * dy + ext[e + 10] * dz
+    }
+
+    /** The [pct]-percentile confidence over masked pixels of view at [dBase] (the drop threshold). */
+    private fun maskedConfPercentile(conf: FloatArray, dBase: Int, mask: FloatArray, pct: Int): Float {
+        val vals = ArrayList<Float>(4096)
+        for (idx in mask.indices) if (mask[idx] >= 0.5f) vals.add(conf[dBase + idx])
+        if (vals.size < 16) return Float.NEGATIVE_INFINITY // too few to gate; keep all
+        vals.sort()
+        return vals[(vals.size * pct / 100).coerceIn(0, vals.size - 1)]
+    }
+
     /** Pack a world point into a voxel-grid key (~[VOXEL_M] m cells) for dedup across views. */
     private fun voxelKey(x: Float, y: Float, z: Float): Long {
         val inv = 1f / VOXEL_M
@@ -315,6 +459,9 @@ class BatchReconstructor(
 
         /** Dedup voxel size (m): merges overlapping points across views into one. */
         private const val VOXEL_M = 0.003f
+
+        /** Multi-view: drop the lowest this-percent of masked pixels by DA3 confidence per view. */
+        private const val CONF_DROP_PCT = 20
 
         /** Density filter: min occupied cells in a point's 26-voxel neighborhood to keep it (else a
          *  stray floater). 2 kills singletons and isolated pairs while sparing silhouette edges. */

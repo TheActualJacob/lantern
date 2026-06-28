@@ -225,6 +225,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         val segModelPath = resolveModelPath("fastsam_s_v79.bin")
         liveReconstructor = LiveReconstructor(
             da3ModelPath, qnnModelPath, applicationInfo.nativeLibraryDir, segModelPath,
+            resolveMvModelPath(),
         )
 
         frameRecorder = FrameRecorder(this)
@@ -376,6 +377,14 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         val name = candidates.first()
         return (getExternalFilesDir(null)?.let { File(it, name) } ?: File(filesDir, name)).absolutePath
     }
+
+    /**
+     * Resolves the **multi-view** DA3 `.pte` (exported by `export_da3_mv_executorch.py`), used only
+     * for the directed/guided *build*. The `_n<N>_r<RES>` suffix encodes the fixed view count +
+     * resolution. Same adb-push'able external dir; returns null when absent so the build falls back
+     * to the mono per-frame path.
+     */
+    private fun resolveMvModelPath(): String? = resolveModelPath("da3_mv_n8_r350.pte")
 
     /**
      * Locates the Qualcomm QNN depth model for the native Hexagon-NPU backend. Prefers a
