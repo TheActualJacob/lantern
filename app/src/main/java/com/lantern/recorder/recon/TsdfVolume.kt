@@ -125,11 +125,28 @@ class TsdfVolume(
                     val vi = v.toInt()
                     if (ui < 0 || ui >= dw || vi < 0 || vi >= dh) continue
                     val pix = vi * dw + ui
-                    // The segmentation mask IS the object filter: skip voxels projecting onto a
-                    // background (non-object) pixel so the floor/clutter never fuses, even though
-                    // the geometric culls are disabled when a mask is present.
-                    if (mask != null && pix < mask.size && mask[pix] < 0.5f) continue
                     val dz = d[pix]
+                    // The segmentation mask IS the object filter. A voxel projecting onto a
+                    // background (non-object) pixel is not just skipped — it's *carved*: its weight
+                    // is bled off and, once gone, its TSDF reset to empty, so a region SAM has
+                    // stopped reporting fades out of the mesh instead of persisting forever (the
+                    // additive TSDF would otherwise keep any background it ever saw). Only carve
+                    // voxels we can actually see this frame — at or in front of the observed surface
+                    // (within the truncation band) — so geometry occluded behind a surface, and
+                    // pixels with no depth, are left untouched and never erode the real object.
+                    if (mask != null && pix < mask.size && mask[pix] < 0.5f) {
+                        val ci = jBase + i
+                        if (weight[ci] > 0f && dz > 0f && camZ <= dz + sdfTrunc) {
+                            val wNew = weight[ci] - CARVE_RATE
+                            if (wNew <= 0f) {
+                                weight[ci] = 0f
+                                tsdf[ci] = 1f
+                            } else {
+                                weight[ci] = wNew
+                            }
+                        }
+                        continue
+                    }
                     if (dz <= 0f) continue
                     val sdf = dz - camZ
                     if (sdf < -sdfTrunc) continue
@@ -170,5 +187,10 @@ class TsdfVolume(
         /** Cull plane is lifted this far above the detected surface to clear plane noise/thickness
          *  while keeping the object's base (ARCore plane Y is only cm-accurate). */
         private const val GROUND_MARGIN = 0.01f // 1 cm
+
+        /** Weight bled off a voxel each frame it's visibly observed as background (mask=0). Lower
+         *  than the per-frame object weight gain so flickering object edges recover, but enough that
+         *  a region the mask truly abandons clears within a handful of fused frames. */
+        private const val CARVE_RATE = 4f
     }
 }
