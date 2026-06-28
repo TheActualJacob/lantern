@@ -61,12 +61,15 @@ class TsdfVolume(
      * @param cameraToWorld row-major 4x4 ARCore camera-to-world pose.
      * @param groundY optional world-Y of the support surface; voxels at/below it (plus a small
      *   margin) are skipped so the object reconstructs without the table/floor it rests on.
+     * @param mask optional foreground mask (object saliency 0..1) at [depth] resolution; a voxel
+     *   projecting onto a background pixel is skipped, so only the segmented object is fused.
      */
     fun integrate(
         depth: DepthMap,
         intrinsics: CameraIntrinsics,
         cameraToWorld: FloatArray,
         groundY: Float? = null,
+        mask: FloatArray? = null,
     ) {
         if (!centered) return
         val cullBelowY = groundY?.let { it + GROUND_MARGIN }

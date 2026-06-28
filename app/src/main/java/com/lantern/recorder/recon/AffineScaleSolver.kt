@@ -38,16 +38,17 @@ object AffineScaleSolver {
         metric: DepthMap,
         confThreshold: Float = 0.5f,
         focusDepthM: Float? = null,
+        mask: FloatArray? = null,
     ): DepthMap? {
         val w = metric.width
         val h = metric.height
         val dispAtMetric = resizeNearest(disp, w, h)
-        // Prefer fitting the scale on the object's depth shell (so the background doesn't dominate
-        // the fit and shift the object frame-to-frame); fall back to a full-frame fit if the
-        // banded set is too small to solve.
-        val affine = (focusDepthM?.let { solve(dispAtMetric, metric, confThreshold, it) }
-            ?: solve(dispAtMetric, metric, confThreshold))
-            ?: solve(dispAtMetric, metric, confThreshold)
+        // Prefer fitting the scale on the object (mask + depth shell) so the background doesn't
+        // dominate the fit and shift the object frame-to-frame; fall back progressively to a
+        // full-frame fit if too few samples remain.
+        val affine = solve(dispAtMetric, metric, confThreshold, focusDepthM, mask)
+            ?: solve(dispAtMetric, metric, confThreshold, focusDepthM, null)
+            ?: solve(dispAtMetric, metric, confThreshold, null, null)
             ?: return null
 
         val out = FloatArray(w * h)
@@ -68,6 +69,7 @@ object AffineScaleSolver {
         metric: DepthMap,
         confThreshold: Float,
         focusDepthM: Float? = null,
+        mask: FloatArray? = null,
     ): Affine? {
         val depth = metric.depthMeters
         val conf = metric.confidence
@@ -79,6 +81,7 @@ object AffineScaleSolver {
         for (i in 0 until n) {
             val dm = depth[i]
             if (dm <= 0.0f || dm.toDouble() >= SATURATED_DEPTH_M || !dm.isFinite()) continue
+            if (mask != null && mask[i] < 0.5f) continue
             if (near != null && (dm < near || dm > far!!)) continue
             if (conf != null && conf[i] < confThreshold) continue
             val x = dispValues[i].toDouble()

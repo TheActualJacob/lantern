@@ -81,3 +81,6 @@ depth_anything_v3-qnn_dlc-float/
 qairt/
 # Qualcomm runtime libs (licensed, not redistributable) — copy per QNN_SETUP.md
 app/src/main/jniLibs/arm64-v8a/*.so
+
+# FastSAM QNN context binary (AI Hub export) — local only
+fastsam-qnn/

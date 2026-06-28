@@ -27,6 +27,7 @@ class LiveReconstructor(
     da3ModelPath: String? = null,
     qnnModelPath: String? = null,
     nativeLibDir: String? = null,
+    segModelPath: String? = null,
 ) {
     private val volume = TsdfVolume()
     private val arcoreDepth = ArCoreRawDepthSource()
@@ -39,6 +40,11 @@ class LiveReconstructor(
     private val depth: DepthBackend? =
         qnnModelPath?.let { QnnDlcDepthModel.loadOrNull(it, nativeLibDir) }
             ?: da3ModelPath?.let { ExecuTorchDepthModel.loadOrNull(it) }
+
+    /** FastSAM object segmenter (NPU). When loaded, fusion is gated to the object mask. */
+    private val seg: QnnSegmentationModel? = segModelPath?.let { QnnSegmentationModel.loadOrNull(it, nativeLibDir) }
+
+    val segActive: Boolean get() = seg != null
 
     private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "live-recon").apply { isDaemon = true } }
     private val busy = AtomicBoolean(false)
@@ -105,7 +111,7 @@ class LiveReconstructor(
 
         // Acquire metric depth now (Frame is only valid on this thread, this call).
         val depthMap = arcoreDepth.acquire(frame) ?: return
-        val argb = if (depth != null) {
+        val argb = if (depth != null || seg != null) {
             try {
                 frame.acquireCameraImage().use { ImageUtils.yuvToArgb(it) }
             } catch (e: Exception) {
@@ -143,12 +149,22 @@ class LiveReconstructor(
         // fit on the object instead of the background.
         val focusDepth = centerMedianDepth(arcoreMetric)
 
+        // Object mask (FastSAM) aligned to the depth image; gates the scale fit and fusion so only
+        // the segmented object is reconstructed. Null when segmentation is off/nothing at center.
+        val mask = if (argb != null && seg != null) {
+            seg.inferObjectMask(argb, arcoreMetric.width, arcoreMetric.height)
+        } else {
+            null
+        }
+
         // Prefer DA3 dense metric depth (scaled vs ARCore) when available.
         var fusionDepth = arcoreMetric
         if (argb != null && depth != null) {
             val disp = depth.inferDisparity(argb)
             if (disp != null) {
-                val dense = AffineScaleSolver.buildMetricDepth(disp, arcoreMetric, focusDepthM = focusDepth)
+                val dense = AffineScaleSolver.buildMetricDepth(
+                    disp, arcoreMetric, focusDepthM = focusDepth, mask = mask,
+                )
                 if (dense != null) fusionDepth = dense
             }
         }
@@ -176,7 +192,7 @@ class LiveReconstructor(
         }
         if (!volume.isCentered) return
 
-        volume.integrate(fusionDepth, depthIntrinsics, cameraToWorld, lastGroundPlaneY)
+        volume.integrate(fusionDepth, depthIntrinsics, cameraToWorld, lastGroundPlaneY, mask)
         integratedFrames++
 
         if (integratedFrames % EXTRACT_EVERY == 0) {
@@ -242,7 +258,10 @@ class LiveReconstructor(
 
     fun close() {
         running = false
-        worker.execute { depth?.close() }
+        worker.execute {
+            depth?.close()
+            seg?.close()
+        }
         worker.shutdown()
     }
 

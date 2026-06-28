@@ -46,6 +46,18 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_com_lantern_recorder_recon_QnnNative_nativeInfer(JNIEnv*, jobject, jlong, jfloatArray, jfloatArray) {
     return JNI_FALSE;
 }
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_lantern_recorder_recon_QnnNative_nativeInferN(JNIEnv*, jobject, jlong, jobjectArray, jobjectArray) {
+    return JNI_FALSE;
+}
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_com_lantern_recorder_recon_QnnNative_nativeOutputNames(JNIEnv* env, jobject, jlong) {
+    return env->NewObjectArray(0, env->FindClass("java/lang/String"), nullptr);
+}
+extern "C" JNIEXPORT jintArray JNICALL
+Java_com_lantern_recorder_recon_QnnNative_nativeIoElems(JNIEnv* env, jobject, jlong, jint) {
+    return env->NewIntArray(0);
+}
 extern "C" JNIEXPORT void JNICALL
 Java_com_lantern_recorder_recon_QnnNative_nativeClose(JNIEnv*, jobject, jlong) {}
 
@@ -98,13 +110,11 @@ struct QnnDepthContext {
     // memory (dims/ids/name), so it must outlive inference and is freed in nativeClose.
     QnnSystemContext_Handle_t sysCtxHandle = nullptr;
 
-    // Tensor templates queried from the binary (shape/ids), filled with client buffers per call.
-    Qnn_Tensor_t inputTensor{};
-    Qnn_Tensor_t outputTensor{};
-
-    int res = 0;
-    size_t inputElems = 0;   // res*res*3
-    size_t outputElems = 0;  // res*res
+    // All graph IO tensor templates (shape/ids), filled with client buffers per call. Supports
+    // multi-output models (e.g. FastSAM's boxes/scores/coeffs/protos) as well as single-output
+    // depth. Caller passes correctly-sized buffers in graph IO order.
+    std::vector<Qnn_Tensor_t> inputTensors;
+    std::vector<Qnn_Tensor_t> outputTensors;
 };
 
 // The graph IO fields shared by GraphInfo V1/V2/V3 (same leading layout, different versions).
@@ -149,6 +159,21 @@ void setRawClientBuf(Qnn_Tensor_t* t, void* data, uint32_t size) {
         t->v1.memType = QNN_TENSORMEMTYPE_RAW;
         t->v1.clientBuf = { data, size };
     }
+}
+
+const char* tensorName(const Qnn_Tensor_t& t) {
+    return (t.version == QNN_TENSOR_VERSION_2) ? t.v2.name : t.v1.name;
+}
+
+// Number of float elements in a tensor (product of its dimensions).
+size_t tensorElems(const Qnn_Tensor_t& t) {
+    uint32_t rank;
+    const uint32_t* dims;
+    if (t.version == QNN_TENSOR_VERSION_2) { rank = t.v2.rank; dims = t.v2.dimensions; }
+    else { rank = t.v1.rank; dims = t.v1.dimensions; }
+    size_t n = 1;
+    for (uint32_t i = 0; i < rank; ++i) n *= dims[i];
+    return n;
 }
 
 // Resolve QnnInterface_getProviders from a dlopen'd backend lib and pick the first provider.
@@ -243,9 +268,6 @@ Java_com_lantern_recorder_recon_QnnNative_nativeInit(JNIEnv* env, jobject, jstri
     LOGI("QNN init: %s (res=%d)", modelPath, jRes);
 
     auto* c = new QnnDepthContext();
-    c->res = jRes;
-    c->inputElems = static_cast<size_t>(jRes) * jRes * 3;
-    c->outputElems = static_cast<size_t>(jRes) * jRes;
 
     bool ok = false;
     do {
@@ -286,10 +308,15 @@ Java_com_lantern_recorder_recon_QnnNative_nativeInit(JNIEnv* env, jobject, jstri
         if (c->qnn.graphRetrieve(c->context, io.name, &c->graph) != QNN_SUCCESS) {
             LOGE("graphRetrieve('%s') failed", io.name ? io.name : "?"); break;
         }
-        // DA3 is single-in/single-out; copy the descriptors so we can attach client buffers.
+        // Copy all IO tensor descriptors (supports multi-output models) so we can attach client
+        // buffers per call. Order matches the graph; callers map outputs by name (nativeOutputNames).
         if (io.numInputs >= 1 && io.numOutputs >= 1) {
-            c->inputTensor = io.inputs[0];
-            c->outputTensor = io.outputs[0];
+            for (uint32_t i = 0; i < io.numInputs; ++i) c->inputTensors.push_back(io.inputs[i]);
+            for (uint32_t i = 0; i < io.numOutputs; ++i) {
+                c->outputTensors.push_back(io.outputs[i]);
+                LOGI("QNN output[%u] '%s' elems=%zu", i, tensorName(io.outputs[i]),
+                     tensorElems(io.outputs[i]));
+            }
         } else {
             LOGE("graph missing IO tensors"); break;
         }
@@ -314,23 +341,16 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_com_lantern_recorder_recon_QnnNative_nativeInfer(
         JNIEnv* env, jobject, jlong handle, jfloatArray jInput, jfloatArray jOutput) {
     auto* c = reinterpret_cast<QnnDepthContext*>(handle);
-    if (!c || !c->graph) return JNI_FALSE;
-
-    const jsize inN = env->GetArrayLength(jInput);
-    const jsize outN = env->GetArrayLength(jOutput);
-    if ((size_t)inN < c->inputElems || (size_t)outN < c->outputElems) {
-        LOGE("infer buffer size mismatch (in=%d out=%d)", inN, outN);
-        return JNI_FALSE;
-    }
+    if (!c || !c->graph || c->inputTensors.empty() || c->outputTensors.empty()) return JNI_FALSE;
 
     jfloat* input = env->GetFloatArrayElements(jInput, nullptr);
     jfloat* output = env->GetFloatArrayElements(jOutput, nullptr);
 
     // Point the (copied) tensor descriptors at our client buffers (CPU memory, RAW layout).
-    Qnn_Tensor_t in = c->inputTensor;
-    Qnn_Tensor_t out = c->outputTensor;
-    setRawClientBuf(&in, input, static_cast<uint32_t>(c->inputElems * sizeof(float)));
-    setRawClientBuf(&out, output, static_cast<uint32_t>(c->outputElems * sizeof(float)));
+    Qnn_Tensor_t in = c->inputTensors[0];
+    Qnn_Tensor_t out = c->outputTensors[0];
+    setRawClientBuf(&in, input, static_cast<uint32_t>(env->GetArrayLength(jInput) * sizeof(float)));
+    setRawClientBuf(&out, output, static_cast<uint32_t>(env->GetArrayLength(jOutput) * sizeof(float)));
 
     Qnn_ErrorHandle_t err = c->qnn.graphExecute(
         c->graph, &in, 1, &out, 1, /*profile*/ nullptr, /*signal*/ nullptr);
@@ -341,6 +361,73 @@ Java_com_lantern_recorder_recon_QnnNative_nativeInfer(
     env->ReleaseFloatArrayElements(jInput, input, JNI_ABORT);          // input not modified
     env->ReleaseFloatArrayElements(jOutput, output, ok ? 0 : JNI_ABORT); // commit on success
     return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+// Multi-input/output inference: float[][] in graph order. Used by FastSAM (1 in, 4 out).
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_lantern_recorder_recon_QnnNative_nativeInferN(
+        JNIEnv* env, jobject, jlong handle, jobjectArray jInputs, jobjectArray jOutputs) {
+    auto* c = reinterpret_cast<QnnDepthContext*>(handle);
+    if (!c || !c->graph) return JNI_FALSE;
+    const jsize ni = env->GetArrayLength(jInputs);
+    const jsize no = env->GetArrayLength(jOutputs);
+    if ((size_t)ni != c->inputTensors.size() || (size_t)no != c->outputTensors.size()) {
+        LOGE("inferN arity mismatch (in %d/%zu out %d/%zu)", ni, c->inputTensors.size(),
+             no, c->outputTensors.size());
+        return JNI_FALSE;
+    }
+
+    std::vector<jfloatArray> inArr(ni), outArr(no);
+    std::vector<jfloat*> inPtr(ni), outPtr(no);
+    std::vector<Qnn_Tensor_t> ins(ni), outs(no);
+    for (jsize i = 0; i < ni; ++i) {
+        inArr[i] = (jfloatArray)env->GetObjectArrayElement(jInputs, i);
+        inPtr[i] = env->GetFloatArrayElements(inArr[i], nullptr);
+        ins[i] = c->inputTensors[i];
+        setRawClientBuf(&ins[i], inPtr[i], (uint32_t)(env->GetArrayLength(inArr[i]) * sizeof(float)));
+    }
+    for (jsize i = 0; i < no; ++i) {
+        outArr[i] = (jfloatArray)env->GetObjectArrayElement(jOutputs, i);
+        outPtr[i] = env->GetFloatArrayElements(outArr[i], nullptr);
+        outs[i] = c->outputTensors[i];
+        setRawClientBuf(&outs[i], outPtr[i], (uint32_t)(env->GetArrayLength(outArr[i]) * sizeof(float)));
+    }
+
+    Qnn_ErrorHandle_t err = c->qnn.graphExecute(
+        c->graph, ins.data(), ni, outs.data(), no, /*profile*/ nullptr, /*signal*/ nullptr);
+    bool ok = (err == QNN_SUCCESS);
+    if (!ok) LOGE("graphExecute(N) failed: %lld", (long long)err);
+
+    for (jsize i = 0; i < ni; ++i) env->ReleaseFloatArrayElements(inArr[i], inPtr[i], JNI_ABORT);
+    for (jsize i = 0; i < no; ++i) env->ReleaseFloatArrayElements(outArr[i], outPtr[i], ok ? 0 : JNI_ABORT);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+// Output tensor names in graph order (so callers can map FastSAM outputs by name).
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_com_lantern_recorder_recon_QnnNative_nativeOutputNames(JNIEnv* env, jobject, jlong handle) {
+    auto* c = reinterpret_cast<QnnDepthContext*>(handle);
+    jclass strCls = env->FindClass("java/lang/String");
+    if (!c) return env->NewObjectArray(0, strCls, nullptr);
+    jobjectArray arr = env->NewObjectArray(c->outputTensors.size(), strCls, nullptr);
+    for (size_t i = 0; i < c->outputTensors.size(); ++i) {
+        const char* nm = tensorName(c->outputTensors[i]);
+        env->SetObjectArrayElement(arr, i, env->NewStringUTF(nm ? nm : ""));
+    }
+    return arr;
+}
+
+// Element counts for inputs (jWhich=0) or outputs (jWhich=1), graph order.
+extern "C" JNIEXPORT jintArray JNICALL
+Java_com_lantern_recorder_recon_QnnNative_nativeIoElems(JNIEnv* env, jobject, jlong handle, jint jWhich) {
+    auto* c = reinterpret_cast<QnnDepthContext*>(handle);
+    if (!c) return env->NewIntArray(0);
+    auto& v = (jWhich == 0) ? c->inputTensors : c->outputTensors;
+    jintArray arr = env->NewIntArray(v.size());
+    std::vector<jint> tmp(v.size());
+    for (size_t i = 0; i < v.size(); ++i) tmp[i] = (jint)tensorElems(v[i]);
+    env->SetIntArrayRegion(arr, 0, v.size(), tmp.data());
+    return arr;
 }
 
 extern "C" JNIEXPORT void JNICALL

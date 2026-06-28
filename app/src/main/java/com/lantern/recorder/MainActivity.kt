@@ -171,7 +171,10 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         // directly `adb push`-able (/sdcard/Android/data/<pkg>/files/), then internal.
         val da3ModelPath = resolveDa3ModelPath()
         val qnnModelPath = resolveQnnModelPath()
-        liveReconstructor = LiveReconstructor(da3ModelPath, qnnModelPath, applicationInfo.nativeLibraryDir)
+        val segModelPath = resolveModelPath("fastsam_s_v79.bin")
+        liveReconstructor = LiveReconstructor(
+            da3ModelPath, qnnModelPath, applicationInfo.nativeLibraryDir, segModelPath,
+        )
 
         frameRecorder = FrameRecorder(this)
         frameRecorder.onFrameSaved = { index, sessionName ->
@@ -315,11 +318,16 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
      * build) so [LiveReconstructor] uses ExecuTorch/ARCore instead.
      */
     private fun resolveQnnModelPath(): String? {
-        val candidates = listOf("da3_qnn_v79.bin", "depth_anything_v3.dlc")
-        for (name in candidates) {
-            getExternalFilesDir(null)?.let { File(it, name) }?.let { if (it.exists()) return it.absolutePath }
-            File(filesDir, name).let { if (it.exists()) return it.absolutePath }
+        for (name in listOf("da3_qnn_v79.bin", "depth_anything_v3.dlc")) {
+            resolveModelPath(name)?.let { return it }
         }
+        return null
+    }
+
+    /** Absolute path to a model file in the external files dir (adb-push'able) or internal, or null. */
+    private fun resolveModelPath(name: String): String? {
+        getExternalFilesDir(null)?.let { File(it, name) }?.let { if (it.exists()) return it.absolutePath }
+        File(filesDir, name).let { if (it.exists()) return it.absolutePath }
         return null
     }
 

@@ -100,20 +100,9 @@ class QnnDlcDepthModel private constructor(
                 Log.i(TAG, "QNN model not present ($modelPath); skipping QNN depth backend")
                 return null
             }
-            // The HTP backend loads the Hexagon skel via fastRPC, which searches ADSP_LIBRARY_PATH.
-            // Add the app's extracted nativeLibraryDir (where libQnnHtpV79Skel.so lives) so the DSP
-            // can find it; without this, device/context bring-up fails (e.g. 0x36b1). Must be set
-            // before the native QNN init below.
-            if (nativeLibDir != null) {
-                try {
-                    val search = "$nativeLibDir;/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;" +
-                        "/vendor/lib64/rfsa/adsp;/system/lib/rfsa/adsp;/dsp"
-                    android.system.Os.setenv("ADSP_LIBRARY_PATH", search, true)
-                    Log.i(TAG, "ADSP_LIBRARY_PATH=$search")
-                } catch (t: Throwable) {
-                    Log.w(TAG, "could not set ADSP_LIBRARY_PATH: ${t.message}")
-                }
-            }
+            // The HTP backend loads the Hexagon skel via fastRPC (ADSP_LIBRARY_PATH); set it to the
+            // app's extracted lib dir before init or device bring-up fails (0x36b1).
+            QnnNative.setAdspLibraryPath(nativeLibDir)
             return try {
                 val handle = QnnNative.nativeInit(modelPath, res)
                 if (handle == 0L) {
@@ -145,11 +134,36 @@ internal object QnnNative {
         false
     }
 
+    /**
+     * Point fastRPC at the app's extracted native-lib dir (where libQnnHtpV79Skel.so lives) so the
+     * HTP backend can load the Hexagon skel onto the DSP; without it device bring-up fails (0x36b1).
+     * Process-global and idempotent — call before any nativeInit. No-op if [nativeLibDir] is null.
+     */
+    fun setAdspLibraryPath(nativeLibDir: String?) {
+        if (nativeLibDir == null) return
+        try {
+            val search = "$nativeLibDir;/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;" +
+                "/vendor/lib64/rfsa/adsp;/system/lib/rfsa/adsp;/dsp"
+            android.system.Os.setenv("ADSP_LIBRARY_PATH", search, true)
+        } catch (t: Throwable) {
+            Log.w(TAG, "could not set ADSP_LIBRARY_PATH: ${t.message}")
+        }
+    }
+
     /** Init QNN HTP backend + context from a `.dlc`/`.bin`; returns an opaque handle or 0. */
     external fun nativeInit(modelPath: String, res: Int): Long
 
     /** Run one frame: NHWC `[0,1]` `input` (res*res*3) -> `output` depth (res*res). */
     external fun nativeInfer(handle: Long, input: FloatArray, output: FloatArray): Boolean
+
+    /** Multi-IO inference (graph order). For models with several outputs (e.g. FastSAM). */
+    external fun nativeInferN(handle: Long, inputs: Array<FloatArray>, outputs: Array<FloatArray>): Boolean
+
+    /** Output tensor names in graph order, to map multi-output models by name. */
+    external fun nativeOutputNames(handle: Long): Array<String>
+
+    /** Element counts (graph order) for inputs (which=0) or outputs (which=1). */
+    external fun nativeIoElems(handle: Long, which: Int): IntArray
 
     /** Free the QNN context/backend for [handle]. */
     external fun nativeClose(handle: Long)
