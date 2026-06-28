@@ -141,6 +141,7 @@ fun CaptureOverlay(
         // Prominent, can't-miss flip-flow card (only during the two-pass flip sequence).
         FlipFlowBanner(
             phase = state.scanPhase,
+            onManualReady = state::forceReadyForPassTwo,
             modifier = Modifier
                 .align(Alignment.Center)
                 .padding(horizontal = 32.dp),
@@ -807,9 +808,14 @@ private fun TopStartControls(
 @Composable
 private fun FlipFlowBanner(
     phase: ScanPhase,
+    onManualReady: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     data class FlipCopy(val title: String, val body: String, val iconRes: Int, val accent: Color, val pulse: Boolean)
+
+    // The "needs flip" / "flipping" states accept a manual tap to advance, in case depth
+    // detection misses the settle (object too small, glare, occluded).
+    val manualAdvanceable = phase == ScanPhase.NeedsFlip || phase == ScanPhase.Flipping
 
     val copy: FlipCopy? = when (phase) {
         ScanPhase.NeedsFlip -> FlipCopy(
@@ -842,6 +848,8 @@ private fun FlipFlowBanner(
         modifier = modifier,
     ) {
         val shown = remember(copy) { copy } ?: return@AnimatedVisibility
+        val manualHint = stringResource(R.string.flip_manual_hint)
+        val manualCd = stringResource(R.string.flip_manual_cd)
         val pulseT = rememberInfiniteTransition(label = "flip-pulse")
         val iconScale by pulseT.animateFloat(
             initialValue = 1f,
@@ -856,9 +864,24 @@ private fun FlipFlowBanner(
             shadowElevation = 12.dp,
             modifier = Modifier
                 .widthIn(max = 420.dp)
+                .then(
+                    if (manualAdvanceable) {
+                        Modifier
+                            .clip(RoundedCornerShape(24.dp))
+                            .clickable(
+                                role = Role.Button,
+                                onClickLabel = manualCd,
+                                onClick = onManualReady,
+                            )
+                    } else {
+                        Modifier
+                    },
+                )
                 .semantics {
                     liveRegion = LiveRegionMode.Assertive
-                    contentDescription = "${shown.title}. ${shown.body}"
+                    contentDescription =
+                        "${shown.title}. ${shown.body}" +
+                        if (manualAdvanceable) ". $manualCd" else ""
                 },
         ) {
             Row(
@@ -892,6 +915,15 @@ private fun FlipFlowBanner(
                         style = MaterialTheme.typography.bodyMedium,
                         color = Color.White.copy(alpha = 0.82f),
                     )
+                    if (manualAdvanceable) {
+                        Text(
+                            text = manualHint,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = Color(0xFF8FC9FF),
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(top = 6.dp),
+                        )
+                    }
                 }
             }
         }

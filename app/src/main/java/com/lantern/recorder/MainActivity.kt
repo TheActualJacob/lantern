@@ -186,8 +186,14 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         if (frameRecorder.isRecording) {
             val name = frameRecorder.sessionName ?: "—"
             val count = frameRecorder.savedFrameCount
+            val path = frameRecorder.sessionPath
             frameRecorder.stop()
+            // In a two-pass scan, a manual stop means "this side's done" — advance the
+            // flip flow (and tag/arm) exactly like the auto-complete path. Set the phase
+            // before onRecordingStopped so it doesn't reset the flow.
+            val advanced = uiState.finishPassManually()
             uiState.onRecordingStopped(name, count)
+            if (advanced) finalizePassAfterStop(path)
             resetMotionTracking()
             Log.i(TAG, "Saved $count frames to ${frameRecorder.sessionPath}")
         } else {
@@ -219,9 +225,9 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     }
 
     /**
-     * Cuts the current pass's recording when its coverage auto-completes, writes the
-     * pass's grouping metadata, and arms flip detection (after pass one). Runs on the UI
-     * thread; only uses the recorder's public API.
+     * Cuts the current pass's recording when its coverage auto-completes, then writes the
+     * pass's grouping metadata and arms flip detection. Runs on the UI thread; only uses
+     * the recorder's public API.
      */
     private fun autoStopForFlip() {
         if (!frameRecorder.isRecording) return
@@ -231,12 +237,18 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         frameRecorder.stop()
         uiState.onRecordingStopped(name, count)
         Log.i(TAG, "Pass auto-stopped: saved $count frames to $path")
+        finalizePassAfterStop(path)
+    }
 
+    /**
+     * After a two-pass pass ends (auto or manual), tags the session as part of the scan
+     * group and — for pass one — arms the [FlipDetector] against the object's current
+     * location so we can tell when it's lifted and set back down.
+     */
+    private fun finalizePassAfterStop(path: String?) {
         val groupId = scanGroupId
         when (uiState.scanPhase) {
             ScanPhase.NeedsFlip -> {
-                // Pass one done: tag it and arm the flip detector against the object's
-                // current location so we can tell when it's lifted and re-set-down.
                 if (groupId != null && path != null) {
                     SessionStore.writeScanGroup(File(path), groupId, pass = 1, totalPasses = 2)
                 }
@@ -250,7 +262,6 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 lastFlipTickMs = 0L
             }
             ScanPhase.Complete -> {
-                // Pass two done: tag it; the two sessions are now a mergeable group.
                 if (groupId != null && path != null) {
                     SessionStore.writeScanGroup(File(path), groupId, pass = 2, totalPasses = 2)
                 }

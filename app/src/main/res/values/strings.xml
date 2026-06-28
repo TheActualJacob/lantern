@@ -61,6 +61,8 @@
     <string name="flip_needed_body">Flip the object so a new face rests on the surface.</string>
     <string name="flip_inprogress_title">Flipping detected…</string>
     <string name="flip_inprogress_body">Set it back down when you\'re ready.</string>
+    <string name="flip_manual_hint">Tap here if it\'s already flipped</string>
+    <string name="flip_manual_cd">I\'ve flipped it — ready to scan side 2</string>
     <string name="flip_ready_title">New side detected</string>
     <string name="flip_ready_body">Tap the shutter to scan side 2.</string>
     <string name="flip_complete_title">Both sides captured</string>

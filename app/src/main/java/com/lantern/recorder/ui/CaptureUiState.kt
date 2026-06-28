@@ -252,22 +252,26 @@ class CaptureUiState {
         val covered = Integer.bitCount(bandMaskSides) +
             Integer.bitCount(bandMaskUpper) +
             (if (topCovered) 1 else 0)
-        coveragePercent = covered * 100 / TOTAL_PATCHES
+        // Headline metric = orbit completeness (how many azimuth directions seen at ANY
+        // elevation). A normal orbit keeps the phone near one height, so it fills one
+        // elevation band per direction; requiring *both* bands full would never trigger.
+        // "Did you get all the way around" is the meaningful flip-readiness signal.
+        val azimuthCovered = Integer.bitCount(bandMaskSides or bandMaskUpper)
+        coveragePercent = azimuthCovered * 100 / AZIMUTH_SECTORS
         // Successful keyframes mean the user is translating; clear any rotation nag.
         motionWarning = false
 
-        // In two-pass mode, once the reachable hemisphere is sufficiently covered, end
-        // this pass: ask the activity to stop recording and advance the flip flow.
+        // In two-pass mode, once the orbit is essentially complete, end this pass: ask
+        // the activity to stop recording and advance the flip flow.
         maybeCompletePass()
     }
 
-    /** Whether the reachable hemisphere is covered enough to end the current pass. */
+    /** Whether the current side has been orbited enough to end the pass / prompt a flip. */
     private fun passCoverageComplete(): Boolean {
-        // Both ringed bands fully around plus a healthy overall percentage. The top cap
-        // is not required (it's awkward to hit, and becomes a side after the flip anyway).
-        val sidesFull = Integer.bitCount(bandMaskSides) >= AZIMUTH_SECTORS
-        val upperFull = Integer.bitCount(bandMaskUpper) >= AZIMUTH_SECTORS
-        return (sidesFull && upperFull) || coveragePercent >= PASS_COMPLETE_PERCENT
+        // Orbit completeness: nearly all azimuth directions seen (at any elevation), with
+        // a minimum number of keyframes so a quick spin can't trip it early.
+        val azimuthCovered = Integer.bitCount(bandMaskSides or bandMaskUpper)
+        return azimuthCovered >= MIN_AZIMUTH_FOR_PASS && frameCount >= MIN_FRAMES_FOR_PASS
     }
 
     /** Fires the one-shot pass-complete transition during a two-pass scan. */
@@ -275,10 +279,32 @@ class CaptureUiState {
         if (passCompleteFired) return
         if (scanPhase != ScanPhase.PassOne && scanPhase != ScanPhase.PassTwo) return
         if (!passCoverageComplete()) return
-        passCompleteFired = true
-        scanPhase = if (scanPhase == ScanPhase.PassOne) ScanPhase.NeedsFlip else ScanPhase.Complete
+        advancePassPhase()
         // Cut the recording cleanly before the object is handled.
         onRequestStopRecording?.invoke()
+    }
+
+    /**
+     * Advances the flip flow after a pass ends: pass one → needs flip, pass two → done.
+     * One-shot (guarded by [passCompleteFired]); shared by the auto-complete path and a
+     * manual shutter stop so the user can always force "this side's done, prompt me."
+     */
+    private fun advancePassPhase() {
+        if (passCompleteFired) return
+        passCompleteFired = true
+        scanPhase = if (scanPhase == ScanPhase.PassOne) ScanPhase.NeedsFlip else ScanPhase.Complete
+    }
+
+    /**
+     * Manually finishes the current pass (user tapped stop during a two-pass scan).
+     * Returns true if it advanced the flip flow, so the caller can write the pass's
+     * grouping metadata and arm flip detection just like the auto path.
+     */
+    fun finishPassManually(): Boolean {
+        if (!twoPassEnabled) return false
+        if (scanPhase != ScanPhase.PassOne && scanPhase != ScanPhase.PassTwo) return false
+        advancePassPhase()
+        return true
     }
 
     /**
@@ -305,6 +331,17 @@ class CaptureUiState {
     /** Surfaces / clears the "object moved during the scan" warning (recording only). */
     fun onObjectMoved(moved: Boolean) {
         objectMovedWarning = isRecording && moved
+    }
+
+    /**
+     * Manual override for the flip flow: if auto detection misses the flip (e.g. depth
+     * never settles), tapping the prompt forces "ready for side two." Only valid while
+     * waiting for / detecting a flip.
+     */
+    fun forceReadyForPassTwo() {
+        if (scanPhase == ScanPhase.NeedsFlip || scanPhase == ScanPhase.Flipping) {
+            scanPhase = ScanPhase.ReadyForPassTwo
+        }
     }
 
     /**
@@ -367,7 +404,14 @@ class CaptureUiState {
         /** Total dome patches: two ringed bands of [AZIMUTH_SECTORS] + one top cap. */
         const val TOTAL_PATCHES = AZIMUTH_SECTORS * 2 + 1
 
-        /** Coverage (%) at which a pass is considered complete in the two-pass flow. */
-        const val PASS_COMPLETE_PERCENT = 75
+        /**
+         * Azimuth directions (of [AZIMUTH_SECTORS]) that must be seen — at any elevation —
+         * for a pass to count as a complete orbit. Slightly less than full so one stubborn
+         * direction (against a wall, glare) can't stall the flip prompt forever.
+         */
+        const val MIN_AZIMUTH_FOR_PASS = 10
+
+        /** Minimum saved keyframes before a pass can auto-complete (guards quick spins). */
+        const val MIN_FRAMES_FOR_PASS = 10
     }
 }
