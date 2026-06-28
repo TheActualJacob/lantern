@@ -24,9 +24,9 @@ private const val TAG = "LANTERN"
  * loads, its dense depth is scaled against ARCore and fused for a smoother surface.
  */
 class LiveReconstructor(
-    da3ModelPath: String? = null,
-    qnnModelPath: String? = null,
-    nativeLibDir: String? = null,
+    private val da3ModelPath: String? = null,
+    private val qnnModelPath: String? = null,
+    private val nativeLibDir: String? = null,
     segModelPath: String? = null,
     private val mvModelPath: String? = null,
 ) {
@@ -80,13 +80,18 @@ class LiveReconstructor(
     init {
         // DA3 runs on the ExecuTorch runtime (CPU/XNNPACK), a different stack from FastSAM's QNN/NPU
         // context, so the two coexist. Load it off-thread to keep startup snappy and SAM unblocked.
-        worker.execute {
-            val loaded = qnnModelPath?.let { QnnDlcDepthModel.loadOrNull(it, nativeLibDir) }
-                ?: da3ModelPath?.let { ExecuTorchDepthModel.loadOrNull(it) }
-            if (loaded != null) {
-                depth = loaded
-                Log.i(TAG, "Dense depth backend ready: ${loaded.kind}")
-            }
+        worker.execute { loadMonoDepthIfNeeded() }
+    }
+
+    /** Load the live mono DA3 backend if not already present. Idempotent; safe to call on [start].
+     *  Used both at init and to re-acquire it after a directed build freed it for memory headroom. */
+    private fun loadMonoDepthIfNeeded() {
+        if (depth != null) return
+        val loaded = qnnModelPath?.let { QnnDlcDepthModel.loadOrNull(it, nativeLibDir) }
+            ?: da3ModelPath?.let { ExecuTorchDepthModel.loadOrNull(it) }
+        if (loaded != null) {
+            depth = loaded
+            Log.i(TAG, "Dense depth backend ready: ${loaded.kind}")
         }
     }
 
@@ -160,6 +165,16 @@ class LiveReconstructor(
             multiViewLoaded = true
             multiView = mvModelPath?.let { Da3MultiViewModel.loadOrNull(it) }
         }
+        // Free the mono DA3 before the heavy multi-view build. It's a ~100 MB ExecuTorch/XNNPACK
+        // model used only by the *live* path (LiveMesh) — never by the directed build — so keeping it
+        // resident while the multi-view model's own XNNPACK weights cache loads makes two big models
+        // coexist, which OOM-kills the process (crash in XNNWeightsCache::look_up_or_insert). Directed
+        // capture stopped live fusion, so the live backend is idle; release it for build headroom.
+        // ([start] re-acquires it via loadMonoDepthIfNeeded, so LiveMesh after a build isn't stranded.)
+        if (multiView != null) {
+            depth?.close()
+            depth = null
+        }
         return BatchReconstructor(depth, seg, multiView)
     }
 
@@ -173,6 +188,8 @@ class LiveReconstructor(
 
     fun start() {
         running = true
+        // Re-acquire the mono DA3 backend if a prior directed build freed it (LiveMesh needs it).
+        worker.execute { loadMonoDepthIfNeeded() }
     }
 
     fun stop() {
