@@ -84,6 +84,9 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private val liveViewMatrix = FloatArray(16)
     private val liveProjMatrix = FloatArray(16)
     private val liveMvpMatrix = FloatArray(16)
+    // Object-frame mesh -> world model matrix and view*model scratch (segmentation/in-hand mode).
+    private val liveModelMatrix = FloatArray(16)
+    private val liveViewModelMatrix = FloatArray(16)
     private var lastLiveMeshVersion = -1
     private var lastLiveStatsMs = 0L
 
@@ -298,12 +301,17 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     /**
      * Resolves the DA3 `.pte` path, preferring the external files dir (adb-pushable to
-     * `/sdcard/Android/data/com.lantern.recorder/files/da3_small_sm8750.pte`) and falling
+     * `/sdcard/Android/data/com.lantern.recorder/files/da3_small_xnnpack.pte`) and falling
      * back to internal `filesDir`. Returns the external path even if absent so the log
      * points the user at the right place; the loader degrades to ARCore depth when missing.
+     *
+     * This is the **XNNPACK CPU** export (exported by `export_da3_executorch.py --backend
+     * xnnpack`). It runs on CPU so it does NOT contend with FastSAM on the Hexagon NPU — a
+     * second QNN/HTP context fails `nativeInit` while SAM holds the NPU. CPU DA3-Small is
+     * ~0.5 s/frame, fine for keyframe-cadence dense depth.
      */
     private fun resolveDa3ModelPath(): String {
-        val name = "da3_small_sm8750.pte"
+        val name = "da3_small_xnnpack.pte"
         val external = getExternalFilesDir(null)?.let { File(it, name) }
         if (external != null && external.exists()) return external.absolutePath
         val internal = File(filesDir, name)
@@ -687,7 +695,19 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         }
         camera.getViewMatrix(liveViewMatrix, 0)
         camera.getProjectionMatrix(liveProjMatrix, 0, 0.05f, 10f)
-        Matrix.multiplyMM(liveMvpMatrix, 0, liveProjMatrix, 0, liveViewMatrix, 0)
+        // In segmentation/in-hand mode the mesh lives in the object frame O, so overlay it on the
+        // real object via the worker-computed object->world matrix (camera pose + T_OC from the
+        // same frame, so it doesn't swim with camera motion). Otherwise the mesh is already in world
+        // space and the model matrix is identity (MVP = proj · view).
+        val objectToWorld = recon.latestObjectToWorld()
+        if (objectToWorld != null) {
+            // Row-major -> column-major for GL (fromColumnMajor is a transpose, its own inverse).
+            System.arraycopy(com.lantern.recorder.recon.Mat4.fromColumnMajor(objectToWorld), 0, liveModelMatrix, 0, 16)
+            Matrix.multiplyMM(liveViewModelMatrix, 0, liveViewMatrix, 0, liveModelMatrix, 0)
+            Matrix.multiplyMM(liveMvpMatrix, 0, liveProjMatrix, 0, liveViewModelMatrix, 0)
+        } else {
+            Matrix.multiplyMM(liveMvpMatrix, 0, liveProjMatrix, 0, liveViewMatrix, 0)
+        }
         meshRenderer.draw(liveMvpMatrix)
 
         val now = SystemClock.elapsedRealtime()

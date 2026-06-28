@@ -152,6 +152,39 @@ def describe(wrapper) -> None:
             print(f"    {name}: {type(child).__name__}")
 
 
+def patch_rope_for_export(max_pos: int = 4096) -> None:
+    """Make DINOv2 2D-RoPE export-safe.
+
+    ``RotaryPositionEmbedding2D.forward`` sizes its frequency table from
+    ``int(positions.max()) + 1`` — a data-dependent value ``torch.export`` cannot
+    specialize (it raises on the unbacked symint ``u0``). The table is only *indexed*
+    by ``positions``, so any fixed size >= max position + 1 yields identical numerics
+    (the extra rows are never read). For our fixed export resolution the patch grid is
+    tiny (518/14 = 37), so a constant ``max_pos`` is exact, not an approximation.
+    """
+    import torch
+
+    from depth_anything_3.model.dinov2.layers import rope as _rope
+
+    cls = _rope.RotaryPositionEmbedding2D
+
+    def forward(self, tokens: "torch.Tensor", positions: "torch.Tensor") -> "torch.Tensor":
+        feature_dim = tokens.size(-1) // 2
+        cos_comp, sin_comp = self._compute_frequency_components(
+            feature_dim, max_pos, tokens.device, tokens.dtype
+        )
+        vertical_features, horizontal_features = tokens.chunk(2, dim=-1)
+        vertical_features = self._apply_1d_rope(
+            vertical_features, positions[..., 0], cos_comp, sin_comp
+        )
+        horizontal_features = self._apply_1d_rope(
+            horizontal_features, positions[..., 1], cos_comp, sin_comp
+        )
+        return torch.cat((vertical_features, horizontal_features), dim=-1)
+
+    cls.forward = forward
+
+
 def build_export_module(core_module):
     """Wrap the core DA3 net so it has a clean, single-tensor in / single-tensor out forward.
 
@@ -186,7 +219,10 @@ def build_export_module(core_module):
 def example_input(res: int):
     import torch
 
-    return (torch.randn(1, 3, res, res, dtype=torch.float32),)
+    # DA3's net forward expects a multi-view batch (B, N, 3, H, W). For single-image
+    # depth N=1. The on-device loader must feed the same 5D rank (ExecuTorch input
+    # ranks are immutable: a 4D tensor triggers "Error resizing tensor at input 0").
+    return (torch.randn(1, 1, 3, res, res, dtype=torch.float32),)
 
 
 def lower_xnnpack(module, example_inputs):
@@ -248,6 +284,7 @@ def main() -> None:
             return
 
         core = find_core_module(wrapper, args.module_attr)
+        patch_rope_for_export()
         export_module = build_export_module(core)
         example_inputs = example_input(args.res)
 

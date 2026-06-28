@@ -11,6 +11,9 @@ package com.lantern.recorder.recon
  */
 object MarchingCubes {
 
+    /** Hard cap on emitted triangles; keeps the boxed vertex lists from exhausting the heap. */
+    private const val MAX_TRIANGLES = 400_000
+
     fun extract(volume: TsdfVolume): MeshData {
         val n = volume.resolution
         if (n < 2) return MeshData.EMPTY
@@ -35,9 +38,14 @@ object MarchingCubes {
 
         fun idx(i: Int, j: Int, k: Int) = (k * n + j) * n + i
 
-        for (k in 0 until n - 1) {
+        // Safety cap: vertices live in boxed ArrayList<Float>, so a pathological fill (tracking
+        // drift / bad masks carving the whole volume) can OOM. Bound the output and bail cleanly.
+        val maxVertFloats = MAX_TRIANGLES * 9
+
+        outer@ for (k in 0 until n - 1) {
             for (j in 0 until n - 1) {
                 for (i in 0 until n - 1) {
+                    if (verts.size >= maxVertFloats) break@outer
                     // Corner indices in Bourke order.
                     val ci0 = idx(i, j, k)
                     val ci1 = idx(i + 1, j, k)

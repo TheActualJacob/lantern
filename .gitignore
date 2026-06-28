@@ -23,6 +23,7 @@ build/
 
 # Virtual environment
 .venv/
+.venv-da3/
 venv/
 env/
 ENV/
@@ -84,3 +85,6 @@ app/src/main/jniLibs/arm64-v8a/*.so
 
 # FastSAM QNN context binary (AI Hub export) — local only
 fastsam-qnn/
+
+# DA3 ExecuTorch model (~100MB) — tracked on origin/main; local working copy only
+*.pte

@@ -113,4 +113,8 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
     debugImplementation(libs.androidx.compose.ui.tooling)
+
+    // Pure-JVM unit tests for the reconstruction math (e.g. ObjectTracker ICP), runnable
+    // off-device via `:app:testDebugUnitTest`.
+    testImplementation("junit:junit:4.13.2")
 }

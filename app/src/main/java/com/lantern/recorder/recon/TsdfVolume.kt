@@ -78,8 +78,13 @@ class TsdfVolume(
         val maskActive = mask != null
         val cullBelowY = if (maskActive) null else groundY?.let { it + GROUND_MARGIN }
         val centerX = origin[0] + halfExtent
+        val centerY = origin[1] + halfExtent
         val centerZ = origin[2] + halfExtent
-        val radius2 = if (!maskActive && objectRadius > 0f) objectRadius * objectRadius else Float.MAX_VALUE
+        // Spatial cull bounds what fuses so drift / mask noise can't smear across the whole grid
+        // (which also blows up the mesh -> OOM). Mask/object-frame mode uses a sphere around the
+        // object centre (orientation-free, since the object frame's axes are arbitrary); world-frame
+        // mode keeps the vertical cylinder + ground plane.
+        val radius2 = if (objectRadius > 0f) objectRadius * objectRadius else Float.MAX_VALUE
         val worldToCamCv = Mat4.multiply(flip, Mat4.invertRigid(cameraToWorld))
         val fx = intrinsics.fx
         val fy = intrinsics.fy
@@ -96,17 +101,21 @@ class TsdfVolume(
             val wz0 = origin[2] + (k + 0.5f) * voxelSize
             val dz = wz0 - centerZ
             val dz2 = dz * dz
-            if (dz2 > radius2) continue // whole z-slice is outside the object cylinder
+            if (dz2 > radius2) continue // whole z-slice is outside the cull region
             val kBase = k * n * n
             for (j in 0 until n) {
                 val wy0 = origin[1] + (j + 0.5f) * voxelSize
                 // Drop the support surface (and anything below it) so only the object remains.
                 if (cullBelowY != null && wy0 < cullBelowY) continue
+                // Sphere cull (object-frame mode) also bounds the vertical extent; cylinder doesn't.
+                val dy = wy0 - centerY
+                val dy2 = if (maskActive) dy * dy else 0f
+                if (dy2 > radius2) continue
                 val jBase = kBase + j * n
                 for (i in 0 until n) {
                     val wx0 = origin[0] + (i + 0.5f) * voxelSize
                     val dx = wx0 - centerX
-                    if (dx * dx + dz2 > radius2) continue // outside the object cylinder
+                    if (dx * dx + dy2 + dz2 > radius2) continue // outside the object sphere/cylinder
                     Mat4.transformPoint(worldToCamCv, wx0, wy0, wz0, p)
                     val camZ = p[2]
                     if (camZ <= 0f || camZ > depthTrunc) continue

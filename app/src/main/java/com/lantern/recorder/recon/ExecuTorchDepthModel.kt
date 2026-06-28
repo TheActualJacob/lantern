@@ -16,8 +16,8 @@ private const val TAG = "LANTERN"
  * ARCore depth before fusion. Returns null (and logs) if the model is missing or fails, so the
  * pipeline degrades to ARCore-only depth instead of crashing.
  *
- * Input contract (must match the export): 1x3x[res]x[res] float32, **ImageNet-normalized** RGB
- * (NCHW). Output: a single depth tensor [res]x[res] (or 1x[res]x[res]).
+ * Input contract (must match the export): 1x1x3x[res]x[res] float32, **ImageNet-normalized**
+ * RGB (B,N,C,H,W with N=1; DA3's net is multi-view). Output: depth [1,1,[res],[res]].
  *
  * This differs from [QnnDlcDepthModel], which consumes the native `.dlc` with NHWC `[0,1]`
  * input — hence each backend keeps its own [preprocess].
@@ -35,7 +35,10 @@ class ExecuTorchDepthModel private constructor(
     override fun inferDisparity(argb: ImageUtils.Argb): DisparityMap? {
         return try {
             val input = preprocess(argb)
-            val tensor = Tensor.fromBlob(input, longArrayOf(1, 3, res.toLong(), res.toLong()))
+            // DA3's net is multi-view: forward expects (B, N, 3, H, W) with N=1 for a single
+            // image. ExecuTorch input ranks are immutable, so a 4D tensor fails with
+            // "Error resizing tensor at input 0" (rank 5 -> 4). Same NCHW data, 5D shape.
+            val tensor = Tensor.fromBlob(input, longArrayOf(1, 1, 3, res.toLong(), res.toLong()))
             val outputs = module.forward(EValue.from(tensor))
             if (outputs.isEmpty()) {
                 Log.w(TAG, "DA3 forward returned no outputs")

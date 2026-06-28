@@ -33,15 +33,16 @@ class LiveReconstructor(
     private val arcoreDepth = ArCoreRawDepthSource()
 
     /**
-     * Dense-depth backend, picked once at construction. Preference order: native QNN DLC
-     * (Hexagon NPU) -> ExecuTorch `.pte` (CPU/NPU) -> none (ARCore-only). Each loader returns
-     * null when its model/runtime is absent, so this silently degrades on any device.
+     * Dense-depth backend. Preference order: native QNN DLC (Hexagon NPU) -> ExecuTorch `.pte`
+     * (CPU/XNNPACK) -> none (ARCore-only). Loaded **asynchronously on the worker thread** (see the
+     * `init` block) so the ~100 MB DA3 `.pte` load never blocks the GL/main thread or delays the
+     * FastSAM segmenter — that's what previously made it look like SAM + DA3 "can't run together".
+     * Null until the load finishes (or if no model/runtime is present); the pipeline uses ARCore
+     * depth meanwhile and seamlessly upgrades to dense DA3 depth once this is set.
      */
-    private val depth: DepthBackend? =
-        qnnModelPath?.let { QnnDlcDepthModel.loadOrNull(it, nativeLibDir) }
-            ?: da3ModelPath?.let { ExecuTorchDepthModel.loadOrNull(it) }
+    @Volatile private var depth: DepthBackend? = null
 
-    /** FastSAM object segmenter (NPU). When loaded, fusion is gated to the object mask. */
+    /** FastSAM object segmenter (NPU). Loaded eagerly (fast, essential for the mask gate). */
     private val seg: QnnSegmentationModel? = segModelPath?.let { QnnSegmentationModel.loadOrNull(it, nativeLibDir) }
 
     val segActive: Boolean get() = seg != null
@@ -50,6 +51,19 @@ class LiveReconstructor(
     private val busy = AtomicBoolean(false)
     private val meshRef = AtomicReference(MeshData.EMPTY)
     private val versionRef = AtomicReference(0)
+
+    init {
+        // DA3 runs on the ExecuTorch runtime (CPU/XNNPACK), a different stack from FastSAM's QNN/NPU
+        // context, so the two coexist. Load it off-thread to keep startup snappy and SAM unblocked.
+        worker.execute {
+            val loaded = qnnModelPath?.let { QnnDlcDepthModel.loadOrNull(it, nativeLibDir) }
+                ?: da3ModelPath?.let { ExecuTorchDepthModel.loadOrNull(it) }
+            if (loaded != null) {
+                depth = loaded
+                Log.i(TAG, "Dense depth backend ready: ${loaded.kind}")
+            }
+        }
+    }
 
     @Volatile private var lastKeyframePos: FloatArray? = null
     @Volatile private var integratedFrames = 0
@@ -65,29 +79,36 @@ class LiveReconstructor(
     private var reanchorStreak = 0
 
     /**
-     * Object-lock lifecycle (segmentation mode only). The TSDF is permanent, so we never fuse on
-     * faith: SEARCHING warms up until FastSAM has held a single object steadily, then LOCKED fuses
-     * only frames consistent with that object. A transient floor grab is simply skipped; switching
-     * to a genuinely new object requires holding it steadily for [SWITCH_LOCK_MS].
+     * In-hand object-frame tracker (segmentation mode only, LIVE_MESH_PLAN §3). Registers each
+     * frame's masked object cloud to the model and returns `T_OC` (OpenCV-camera -> object). Fusion
+     * happens in the object's own frame, so turning the object in hand is the *expected* case — no
+     * warmup/lock gating, because we no longer assume the object is static in the world.
      */
-    private enum class LockState { SEARCHING, LOCKED }
-    @Volatile private var lockState = LockState.SEARCHING
+    private val tracker = ObjectTracker()
 
-    // Warmup candidate (SEARCHING): the object distance we're building evidence for, the accumulated
-    // on-object evidence (ms), and the timestamp of the last warmup frame. Evidence grows on
-    // consistent frames and erodes slowly on others, so a frequently-locked area — even one that
-    // comes in and out — accumulates and locks, while a rare distractor never unseats it.
-    private var warmupDepth: Float? = null
-    private var warmupScoreMs = 0f
-    private var lastWarmupNs = 0L
+    /** Object-frame pose (`T_OC`, row-major) of the last tracked frame; null until first lock. */
+    @Volatile private var latestObjectPose: FloatArray? = null
 
-    // The locked object's established distance (LOCKED), tracked as an EMA over consistent frames.
-    private var lockedDepth: Float? = null
+    /**
+     * Object-frame -> ARCore world transform (row-major) of the last tracked frame, computed in the
+     * worker from *that frame's* camera pose + `T_OC` (so the two are consistent). The renderer uses
+     * this directly as the mesh model matrix; for a static object it's constant, so the overlay
+     * stays glued smoothly even as the camera moves every frame. Null until first lock.
+     */
+    @Volatile private var latestObjectToWorld: FloatArray? = null
 
-    // Timestamp of the last frame that was actually on the locked object. If we stay off it longer
-    // than [UNLOCK_MS] the lock was wrong (e.g. warmup grabbed the floor) or the object is gone, so
-    // we tear the mesh down and re-search instead of leaving bad geometry baked in forever.
-    private var lastOnLockNs = 0L
+    /** `T_OC` at the last *fused* frame, so we only fuse genuinely new viewpoints of the object. */
+    private var lastFusedPose: FloatArray? = null
+
+    /**
+     * State from the last *accepted* (trusted) track, used to seed the next ICP with ARCore
+     * ego-motion: `T_OC` and the OpenCV camera->world at that frame. The relative camera motion
+     * since then is a far stronger ICP init than constant velocity (verified offline: it removes
+     * the single-bad-frame divergence that otherwise sends the whole track 40°+ off and never
+     * recovers). Both advance together only on an accepted frame, so dropped frames don't poison it.
+     */
+    private var lastGoodObjectPose: FloatArray? = null
+    private var lastGoodCamToWorldCv: FloatArray? = null
 
     @Volatile var debugEnabled = false
     @Volatile private var latestDebugFrame: DebugFrame? = null
@@ -112,15 +133,15 @@ class LiveReconstructor(
     fun reset() {
         worker.execute {
             volume.reset()
+            tracker.reset()
             lastKeyframePos = null
             integratedFrames = 0
             reanchorStreak = 0
-            lockState = LockState.SEARCHING
-            warmupDepth = null
-            warmupScoreMs = 0f
-            lastWarmupNs = 0L
-            lockedDepth = null
-            lastOnLockNs = 0L
+            latestObjectPose = null
+            latestObjectToWorld = null
+            lastFusedPose = null
+            lastGoodObjectPose = null
+            lastGoodCamToWorldCv = null
             meshRef.set(MeshData.EMPTY)
             versionRef.set(versionRef.get() + 1)
         }
@@ -131,6 +152,13 @@ class LiveReconstructor(
 
     /** Bumps whenever a new mesh is published; lets the renderer skip re-uploads. */
     fun meshVersion(): Int = versionRef.get()
+
+    /**
+     * Object-frame -> world model matrix (row-major) for the renderer to overlay the object-frame
+     * mesh on the real object. Null when not tracking (segmentation off / not yet locked) => draw
+     * the mesh directly in world space.
+     */
+    fun latestObjectToWorld(): FloatArray? = latestObjectToWorld
 
     val frameCount: Int get() = integratedFrames
 
@@ -149,14 +177,19 @@ class LiveReconstructor(
         val camX = cameraToWorld[3]
         val camY = cameraToWorld[7]
         val camZ = cameraToWorld[11]
-        // Fusion is gated on camera motion (need a fresh viewpoint), but warmup must keep building
-        // evidence even when the user holds still on the object — otherwise no keyframes fire and
-        // the lock never warms up. So while searching, also process on a time cadence.
+        // Gating differs by mode. Without segmentation the object is assumed static in the world, so
+        // a fresh viewpoint == camera motion (the keyframe gate). With segmentation we track the
+        // object itself, which may move while the camera is still — camera motion is no longer a
+        // proxy for "new viewpoint" — so we process on a time cadence and let the tracker's pose
+        // delta decide what actually fuses.
         val nowNs = System.nanoTime()
-        val warmingUp = seg != null && lockState == LockState.SEARCHING
-        val pollDue = warmingUp && (nowNs - lastProcessNs) >= WARMUP_POLL_MS * 1_000_000L
-        if (!isKeyframe(camX, camY, camZ) && !pollDue) return
-        if (busy.get()) return // worker still chewing the previous keyframe; skip this one
+        val gateOpen = if (seg != null) {
+            (nowNs - lastProcessNs) >= SEG_MIN_INTERVAL_MS * 1_000_000L
+        } else {
+            isKeyframe(camX, camY, camZ)
+        }
+        if (!gateOpen) return
+        if (busy.get()) return // worker still chewing the previous frame; skip this one
 
         // Acquire metric depth now (Frame is only valid on this thread, this call).
         val depthMap = arcoreDepth.acquire(frame) ?: return
@@ -232,8 +265,9 @@ class LiveReconstructor(
 
         // Prefer DA3 dense metric depth (scaled vs ARCore) when available.
         var fusionDepth = arcoreMetric
-        if (argb != null && depth != null) {
-            val disp = depth.inferDisparity(argb)
+        val denseBackend = depth // capture the volatile var for a stable smart-cast
+        if (argb != null && denseBackend != null) {
+            val disp = denseBackend.inferDisparity(argb)
             if (disp != null) {
                 val dense = AffineScaleSolver.buildMetricDepth(
                     disp, arcoreMetric, focusDepthM = focusDepth, mask = mask,
@@ -242,13 +276,11 @@ class LiveReconstructor(
             }
         }
 
-        // What the camera is currently pointed at (object surface point in the world).
-        val centroid = estimateCentroidWorld(fusionDepth, depthIntrinsics, cameraToWorld)
-
-        // Without segmentation there's nothing to lock onto: keep the original behavior — center
-        // once on the look point, re-anchor only after a sustained move, and fuse every frame
-        // (the geometric ground/cylinder culls keep the floor out in this mode).
+        // Without segmentation there's nothing to track: keep the original world-frame behavior —
+        // center once on the look point, re-anchor only after a sustained move, and fuse every
+        // frame (the geometric ground/cylinder culls keep the floor out in this mode).
         if (seg == null) {
+            val centroid = estimateCentroidWorld(fusionDepth, depthIntrinsics, cameraToWorld)
             if (centroid != null) {
                 if (!volume.isCentered) {
                     volume.centerOn(centroid[0], centroid[1], centroid[2]); reanchorStreak = 0
@@ -265,98 +297,173 @@ class LiveReconstructor(
             return
         }
 
-        // Segmentation mode: drive fusion through the object-lock state machine.
-        runLock(maskDepth, centroid, fusionDepth, depthIntrinsics, cameraToWorld, mask)
-    }
-
-    /**
-     * Object-lock state machine (segmentation mode). Decides whether this frame belongs to the
-     * locked object and fuses only if so — so a transient FastSAM floor grab never reaches the
-     * permanent TSDF, and a new object is only adopted after it's held steadily.
-     */
-    private fun runLock(
-        maskDepth: Float?,
-        centroid: FloatArray?,
-        fusionDepth: DepthMap,
-        depthIntrinsics: CameraIntrinsics,
-        cameraToWorld: FloatArray,
-        mask: FloatArray?,
-    ) {
-        val now = System.nanoTime()
-        when (lockState) {
-            LockState.SEARCHING -> {
-                // Warm up by accumulating evidence for one area before committing. Nothing fuses
-                // here, so the mesh starts clean. Evidence persists across in/out gaps, so an area
-                // FastSAM locks onto frequently wins even if it flickers.
-                if (maskDepth == null || centroid == null) return
-                // Per-frame credit, capped so a long gap (object out of view) can't dump evidence.
-                val dtMs = if (lastWarmupNs == 0L) 0f
-                    else ((now - lastWarmupNs) / 1_000_000f).coerceAtMost(WARMUP_DT_CAP_MS)
-                lastWarmupNs = now
-                val cand = warmupDepth
-                when {
-                    cand == null -> {
-                        warmupDepth = maskDepth
-                        warmupScoreMs = 0f
-                    }
-                    kotlin.math.abs(maskDepth - cand) / cand <= LOCK_DEPTH_TOL -> {
-                        // Same area: reinforce and lock once enough evidence has accumulated.
-                        warmupDepth = cand + LOCK_DEPTH_EMA_ALPHA * (maskDepth - cand)
-                        warmupScoreMs += dtMs
-                        if (warmupScoreMs >= WARMUP_LOCK_MS) {
-                            volume.centerOn(centroid[0], centroid[1], centroid[2])
-                            lockedDepth = warmupDepth
-                            integratedFrames = 0
-                            lastOnLockNs = now
-                            lockState = LockState.LOCKED
-                        }
-                    }
-                    else -> {
-                        // A different area: erode the candidate's evidence slowly instead of
-                        // resetting, so a rare distractor can't unseat a frequently-seen object.
-                        // Adopt the newcomer only once the old candidate's evidence is fully spent.
-                        warmupScoreMs -= dtMs * WARMUP_DECAY
-                        if (warmupScoreMs <= 0f) {
-                            warmupDepth = maskDepth
-                            warmupScoreMs = 0f
-                        }
-                    }
-                }
-            }
-            LockState.LOCKED -> {
-                if (maskDepth == null || centroid == null) return // unverifiable; keep lock, don't fuse
-                val ld = lockedDepth
-                val depthOk = ld != null && kotlin.math.abs(maskDepth - ld) / ld <= LOCK_DEPTH_TOL
-                val posOk = !isNewTarget(centroid)
-                if (depthOk && posOk) {
-                    // On the locked object: track its drifting distance, refresh the timer, fuse.
-                    lockedDepth = ld!! + LOCK_DEPTH_EMA_ALPHA * (maskDepth - ld)
-                    lastOnLockNs = now
-                    fuse(fusionDepth, depthIntrinsics, cameraToWorld, mask)
-                } else if (now - lastOnLockNs >= UNLOCK_MS * 1_000_000L) {
-                    // Off the locked object too long: the lock was wrong (warmup grabbed the floor)
-                    // or the object left. Drop the mesh and re-search so bad geometry can't persist.
-                    // A brief excursion (< UNLOCK_MS) is tolerated — the mesh is preserved and this
-                    // frame simply doesn't fuse — so a quick glance away never wipes a good scan.
-                    teardown()
-                }
-                // else: brief excursion — skip this frame, keep the mesh, wait it out.
-            }
+        // Segmentation mode. Two regimes:
+        //  * Static object, camera orbits (the common case): ARCore already tracks the camera, so
+        //    the relative pose between frames is *known* — no registration needed. We fuse the
+        //    SAM-masked depth straight into a world-frame TSDF using the ARCore pose. Robust and
+        //    geometry-independent (works on flat/smooth objects ICP can't grip), because we never
+        //    try to recover the object's motion — the object doesn't move.
+        //  * Object turned in hand: ARCore camera pose no longer encodes the object's motion, so we
+        //    must register cloud-to-model with ICP (fragile on low-relief/smooth objects).
+        if (SEG_USE_ARCORE_POSE) {
+            fuseStaticObject(cameraToWorld, fusionDepth, depthIntrinsics, mask!!)
+        } else {
+            trackAndFuse(cameraToWorld, fusionDepth, depthIntrinsics, mask!!)
         }
     }
 
-    /** Discard the current scan and return to warmup — used when the lock turns out to be wrong. */
-    private fun teardown() {
-        volume.reset()
-        meshRef.set(MeshData.EMPTY)
-        versionRef.set(versionRef.get() + 1)
-        integratedFrames = 0
-        lockState = LockState.SEARCHING
-        warmupDepth = null
-        warmupScoreMs = 0f
-        lastWarmupNs = 0L
-        lockedDepth = null
-        lastOnLockNs = 0L
+    /**
+     * "SAM mask + depth + known camera pose" fusion for a **static** object the camera orbits.
+     * No ICP: ARCore's world tracking supplies the per-frame pose, the mask removes the floor, and
+     * the TSDF's sphere cull bounds it to the object. This sidesteps the registration/drift problem
+     * entirely whenever the object isn't moving — which is the orbit workflow.
+     */
+    private fun fuseStaticObject(
+        cameraToWorld: FloatArray,
+        fusionDepth: DepthMap,
+        depthIntrinsics: CameraIntrinsics,
+        mask: FloatArray,
+    ) {
+        if (!volume.isCentered) {
+            val c = maskedCentroidWorld(fusionDepth, depthIntrinsics, mask, cameraToWorld) ?: return
+            volume.centerOn(c[0], c[1], c[2])
+            integratedFrames = 0
+        }
+        // Mesh is anchored in the world (object is static), so the renderer draws it directly —
+        // no object->world matrix. Clear any stale value from a previous in-hand session.
+        latestObjectPose = null
+        latestObjectToWorld = null
+        fuse(fusionDepth, depthIntrinsics, cameraToWorld, mask)
+    }
+
+    /** World-space centroid of the masked object cloud (for centering the TSDF grid on it). */
+    private fun maskedCentroidWorld(
+        depth: DepthMap,
+        intr: CameraIntrinsics,
+        mask: FloatArray,
+        cameraToWorld: FloatArray,
+    ): FloatArray? {
+        val cloud = backprojectMasked(depth, intr, mask) // OpenCV camera frame
+        val n = cloud.size / 3
+        if (n < MIN_TRACK_POINTS) return null
+        val c2wCv = Mat4.multiply(cameraToWorld, FLIP) // OpenCV-camera -> world
+        var sx = 0f; var sy = 0f; var sz = 0f
+        val w = FloatArray(3)
+        for (i in 0 until n) {
+            Mat4.transformPoint(c2wCv, cloud[i * 3], cloud[i * 3 + 1], cloud[i * 3 + 2], w)
+            sx += w[0]; sy += w[1]; sz += w[2]
+        }
+        val inv = 1f / n
+        return floatArrayOf(sx * inv, sy * inv, sz * inv)
+    }
+
+    /**
+     * In-hand object-frame fusion. Back-projects the masked object into the camera frame, recovers
+     * its pose `T_OC` against the model, and fuses the depth into the TSDF *in the object frame* —
+     * so the reconstruction grows as the object is rotated, with no dependence on world pose.
+     */
+    private fun trackAndFuse(
+        cameraToWorld: FloatArray,
+        fusionDepth: DepthMap,
+        depthIntrinsics: CameraIntrinsics,
+        mask: FloatArray,
+    ) {
+        val cloud = backprojectMasked(fusionDepth, depthIntrinsics, mask)
+        val n = cloud.size / 3
+        if (n < MIN_TRACK_POINTS) return // too little object visible to register reliably
+
+        // ARCore-ego-motion seed: predict this frame's T_OC by carrying the last trusted pose along
+        // the camera's relative motion since that frame. camCv = OpenGL camera->world flipped into
+        // OpenCV (the frame the cloud lives in). rel maps the current camera into the last-good one.
+        val camCv = Mat4.multiply(cameraToWorld, FLIP)
+        val seed = run {
+            val lastTOC = lastGoodObjectPose
+            val lastCam = lastGoodCamToWorldCv
+            if (lastTOC != null && lastCam != null) {
+                val rel = Mat4.multiply(Mat4.invertRigid(lastCam), camCv) // cur cam -> last-good cam
+                Mat4.multiply(lastTOC, rel)
+            } else {
+                null
+            }
+        }
+
+        val tOC = tracker.track(cloud, n, seed)
+        // Drop untrusted registrations: keep the previous mesh + overlay, fuse nothing. This is what
+        // stops bad frames from smearing the object into a drifting blob (bounded by the cull into a
+        // "sphere") — only confidently-registered frames contribute.
+        if (!tracker.lastAccepted) return
+        latestObjectPose = tOC
+        lastGoodObjectPose = tOC
+        lastGoodCamToWorldCv = camCv
+
+        // The first tracked frame defines object frame O (== that camera's OpenCV frame). Center the
+        // TSDF grid on the object's centroid in O so the fixed grid surrounds it.
+        if (!volume.isCentered) {
+            val c = centroidInObject(cloud, n, tOC)
+            volume.centerOn(c[0], c[1], c[2])
+            integratedFrames = 0
+            lastFusedPose = null
+        }
+
+        // Object->world from *this* frame's camera pose + T_OC (consistent pair), for a smooth,
+        // non-swimming overlay. poseForFusion = T_OC·flip maps object-frame voxels into the OpenCV
+        // camera for fusion; its inverse composed with cameraToWorld places the mesh in the world.
+        val poseForFusion = Mat4.multiply(tOC, FLIP)
+        latestObjectToWorld = Mat4.multiply(cameraToWorld, Mat4.invertRigid(poseForFusion))
+
+        // Fuse only genuinely new viewpoints (the object/camera moved enough since the last fuse),
+        // so a still object doesn't pile redundant weight into the same voxels.
+        if (shouldFuse(tOC)) {
+            fuse(fusionDepth, depthIntrinsics, poseForFusion, mask)
+            lastFusedPose = tOC.copyOf()
+        }
+    }
+
+    /** Back-project masked, valid-depth pixels into the OpenCV camera frame (flat xyz, metres). */
+    private fun backprojectMasked(
+        depth: DepthMap,
+        intr: CameraIntrinsics,
+        mask: FloatArray,
+    ): FloatArray {
+        val d = depth.depthMeters
+        val w = depth.width
+        val out = ArrayList<Float>(4096)
+        val n = minOf(d.size, mask.size)
+        var i = 0
+        while (i < n) {
+            if (mask[i] >= 0.5f) {
+                val z = d[i]
+                if (z > 0f && z < 5f) {
+                    val u = i % w
+                    val v = i / w
+                    out.add((u - intr.cx) / intr.fx * z)
+                    out.add((v - intr.cy) / intr.fy * z)
+                    out.add(z)
+                }
+            }
+            i++
+        }
+        return out.toFloatArray()
+    }
+
+    /** Centroid of a camera-frame cloud expressed in object frame O (transform by `T_OC`). */
+    private fun centroidInObject(cloud: FloatArray, count: Int, tOC: FloatArray): FloatArray {
+        var sx = 0f; var sy = 0f; var sz = 0f
+        for (i in 0 until count) { sx += cloud[i * 3]; sy += cloud[i * 3 + 1]; sz += cloud[i * 3 + 2] }
+        val inv = 1f / count
+        val o = FloatArray(3)
+        Mat4.transformPoint(tOC, sx * inv, sy * inv, sz * inv, o)
+        return o
+    }
+
+    /** True if the object moved enough (rotation or translation) since the last fused frame. */
+    private fun shouldFuse(tOC: FloatArray): Boolean {
+        val last = lastFusedPose ?: return true
+        val rel = Mat4.multiply(tOC, Mat4.invertRigid(last))
+        val cos = ((rel[0] + rel[5] + rel[10]) - 1f) / 2f
+        val angDeg = Math.toDegrees(kotlin.math.acos(cos.coerceIn(-1f, 1f)).toDouble())
+        val t = kotlin.math.sqrt(rel[3] * rel[3] + rel[7] * rel[7] + rel[11] * rel[11])
+        return angDeg >= FUSE_ROT_DEG || t >= FUSE_TRANS_M
     }
 
     /** Integrate one frame into the volume and re-mesh on the extract cadence. */
@@ -368,7 +475,10 @@ class LiveReconstructor(
     ) {
         volume.integrate(fusionDepth, depthIntrinsics, cameraToWorld, lastGroundPlaneY, mask)
         integratedFrames++
-        if (integratedFrames % EXTRACT_EVERY == 0) {
+        // Re-mesh early (first few fuses) for instant feedback, then on the steadier cadence so
+        // marching cubes doesn't thrash the worker once the scan is established.
+        val due = if (integratedFrames <= EXTRACT_EVERY) true else integratedFrames % EXTRACT_EVERY == 0
+        if (due) {
             val mesh = volume.extractMesh()
             meshRef.set(mesh)
             versionRef.set(versionRef.get() + 1)
@@ -419,12 +529,13 @@ class LiveReconstructor(
             append("objFound=${mask != null}  maskCov=${"%.1f".format(coverage * 100)}%\n")
             append("focusDepth=${focusDepth?.let { "%.2fm".format(it) } ?: "—"}  ")
             append("ground=${lastGroundPlaneY?.let { "%.2f".format(it) } ?: "—"}\n")
-            if (lockState == LockState.SEARCHING) {
-                append("lock=SEARCHING  warmup=${(100f * warmupScoreMs / WARMUP_LOCK_MS).toInt()}%\n")
+            if (SEG_USE_ARCORE_POSE) {
+                append("mode=ARCore-pose (static/orbit)\n")
             } else {
-                append("lock=LOCKED  lockDepth=${lockedDepth?.let { "%.2fm".format(it) } ?: "—"}\n")
+                append("mode=ICP  track: frames=${tracker.trackedFrames} ")
+                append("fit=${"%.2f".format(tracker.lastFitness)} modelVox=${tracker.modelVoxelCount}\n")
             }
-            append("centered=${volume.isCentered}  frames=$integratedFrames\n")
+            append("centered=${volume.isCentered}  fused=$integratedFrames\n")
             append("depth=${w}x$h  argb=${argb.width}x${argb.height}")
         }
         latestDebugFrame = DebugFrame(out, w, h, text)
@@ -514,25 +625,27 @@ class LiveReconstructor(
         // more than this fraction — i.e. the mask grabbed the floor/background, not the object.
         private const val MASK_DEPTH_TOL = 0.25f
 
-        // Object-lock state machine (segmentation mode):
-        // Warmup: accumulated on-object evidence (ms) needed before anything fuses. Because evidence
-        // persists across in/out gaps, a frequently-locked area reaches this even if it flickers.
-        private const val WARMUP_LOCK_MS = 2_000f
-        // How fast a competing area erodes the current candidate's evidence (x per-frame dt).
-        private const val WARMUP_DECAY = 1.0f
-        // Cap on a single frame's evidence credit, so a long out-of-view gap can't dump score.
-        private const val WARMUP_DT_CAP_MS = 300f
-        // While warming up, process at least this often (ms) even with no camera motion, so holding
-        // still on the object still builds warmup evidence. Fusion stays motion-gated as before.
-        private const val WARMUP_POLL_MS = 150L
-        // Unlock: once we've been off the locked object this long, the lock was wrong (or the object
-        // left) — tear the mesh down and re-search, so a bad (e.g. floor) lock can't live forever.
-        private const val UNLOCK_MS = 3_000L
-        // A frame is "on the locked object" when its mask depth is within this fraction of the
-        // locked distance. Keyframes are gated to 2 cm of motion, so a real object drifts only a
-        // few percent per frame, while a mask jump to the floor spikes far past this.
-        private const val LOCK_DEPTH_TOL = 0.18f
-        // EMA smoothing for the locked/warmup distance (higher tracks deliberate motion faster).
-        private const val LOCK_DEPTH_EMA_ALPHA = 0.2f
+        // Segmentation mode: prefer the robust "SAM mask + ARCore camera pose" world-frame fusion
+        // (static object, camera orbits). Set false to use the in-hand ICP object-frame tracker
+        // instead (needed only when the object itself is turned/moved while scanning).
+        private const val SEG_USE_ARCORE_POSE = true
+
+        // Object-frame tracking (segmentation mode):
+        // Min interval between processed frames; the object may move while the camera is still, so
+        // we can't gate on camera motion. The worker + busy flag throttle the real rate further.
+        private const val SEG_MIN_INTERVAL_MS = 80L
+        // Minimum masked object points to attempt registration (too few => skip, don't corrupt).
+        private const val MIN_TRACK_POINTS = 200
+        // Fuse a frame only once the object has moved this much (new viewpoint) since the last fuse.
+        private const val FUSE_ROT_DEG = 2.0
+        private const val FUSE_TRANS_M = 0.01f
+
+        /** OpenGL(ARCore)<->OpenCV camera flip, diag(1,-1,-1,1); its own inverse. */
+        private val FLIP = floatArrayOf(
+            1f, 0f, 0f, 0f,
+            0f, -1f, 0f, 0f,
+            0f, 0f, -1f, 0f,
+            0f, 0f, 0f, 1f,
+        )
     }
 }
