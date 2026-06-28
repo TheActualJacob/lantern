@@ -37,7 +37,10 @@ import com.lantern.recorder.recording.OpenCvBoardDetector
 import com.lantern.recorder.recording.OrbitPoseProvider
 import com.lantern.recorder.recording.PoseProvider
 import com.lantern.recorder.recording.TurntablePoseProvider
+import android.graphics.Bitmap
 import com.lantern.recorder.recon.BatchReconstructor
+import com.lantern.recorder.recording.PngWriter
+import java.io.FileOutputStream
 import com.lantern.recorder.recon.CameraIntrinsics
 import com.lantern.recorder.recon.DepthMap
 import com.lantern.recorder.recon.ImageUtils
@@ -498,6 +501,14 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             uiState.onDirectedBuilding(true, "")
         }
         batchWorker.execute {
+            // Debug: persist the raw keyframes (RGB + depth + pose/intrinsics + SAM mask) to a
+            // pull-able session dir BEFORE the heavy build, so the exact capture can be inspected
+            // offline (and survives even if the build crashes). See dumpDirectedSession.
+            try {
+                dumpDirectedSession(frames)?.let { Log.i(TAG, "DIRECTED_DUMP saved: ${it.absolutePath}") }
+            } catch (t: Throwable) {
+                Log.e(TAG, "directed session dump failed", t)
+            }
             val mesh = try {
                 recon.reconstruct(frames) { done, total, label ->
                     runOnUiThread { uiState.onDirectedBuilding(true, label) }
@@ -526,6 +537,64 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 }
             }
         }
+    }
+
+    /**
+     * Debug: write the directed keyframes to a pull-able session dir in the same on-disk format as
+     * [com.lantern.recorder.recording.FrameRecorder] (so the host offline tools read it directly):
+     *   sessions/directed_<ts>/  frame_NNNN.png (RGB), depth_NNNN.png (16-bit mm),
+     *                            frame_NNNN.json (pose + intrinsics), masks/mask_NNNN.png (SAM),
+     *                            capture.json
+     * Lets the real on-device capture be reconstructed/inspected offline (multi-view DA3 + .npy)
+     * when in-app results look wrong. Runs on the build worker (SAM + file IO are heavy).
+     */
+    private fun dumpDirectedSession(frames: List<BatchReconstructor.Keyframe>): File? {
+        if (frames.isEmpty()) return null
+        val dir = File(File(getExternalFilesDir(null), "sessions"), "directed_${STAMP.format(Date())}")
+        val masksDir = File(dir, "masks")
+        if (!masksDir.mkdirs() && !masksDir.isDirectory) return null
+        File(dir, "capture.json").writeText("{\n  \"capture_mode\": \"directed\"\n}")
+        for ((i, f) in frames.withIndex()) {
+            val id = "%04d".format(i + 1)
+            // RGB -> 8-bit PNG.
+            val bmp = Bitmap.createBitmap(f.argb.pixels, f.argb.width, f.argb.height, Bitmap.Config.ARGB_8888)
+            FileOutputStream(File(dir, "frame_$id.png")).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            bmp.recycle()
+            // Depth (m) -> 16-bit mm, big-endian (PngWriter expects big-endian samples).
+            val dm = f.depth
+            val depthBytes = ByteArray(dm.width * dm.height * 2)
+            for (p in dm.depthMeters.indices) {
+                val mm = (dm.depthMeters[p] * 1000f).toInt().coerceIn(0, 65535)
+                depthBytes[p * 2] = (mm ushr 8).toByte()
+                depthBytes[p * 2 + 1] = (mm and 0xFF).toByte()
+            }
+            PngWriter.writeGrayscale(File(dir, "depth_$id.png"), depthBytes, dm.width, dm.height, 16)
+            // SAM mask at ~RGB-aspect res (1=object) -> 8-bit PNG. Covers the full image FOV.
+            val mw = (f.argb.width / 3).coerceAtLeast(1)
+            val mh = (f.argb.height / 3).coerceAtLeast(1)
+            liveReconstructor?.inferPreviewMask(f.argb, mw, mh)?.let { mask ->
+                val mb = ByteArray(mw * mh) { idx -> if (mask[idx] > 0.5f) 0xFF.toByte() else 0 }
+                PngWriter.writeGrayscale(File(masksDir, "mask_$id.png"), mb, mw, mh, 8)
+            }
+            // Pose + intrinsics JSON (column-major camera-to-world, like FrameRecorder).
+            val intr = f.intrinsics
+            val json = org.json.JSONObject().apply {
+                put("frame_index", i + 1)
+                put("rgb_width", f.argb.width); put("rgb_height", f.argb.height)
+                put("depth_width", dm.width); put("depth_height", dm.height)
+                put("depth_units", "millimeters")
+                put("pose_matrix_column_major", org.json.JSONArray().apply { f.poseColumnMajor.forEach { put(it.toDouble()) } })
+                put("intrinsics", org.json.JSONObject().apply {
+                    put("fx", intr.fx.toDouble()); put("fy", intr.fy.toDouble())
+                    put("cx", intr.cx.toDouble()); put("cy", intr.cy.toDouble())
+                    put("width", intr.width); put("height", intr.height)
+                })
+                put("object_pose_valid", false)
+            }
+            File(dir, "frame_$id.json").writeText(json.toString(2))
+        }
+        Log.i(TAG, "DIRECTED_DUMP wrote ${frames.size} frames to ${dir.name}")
+        return dir
     }
 
     /**
