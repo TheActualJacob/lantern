@@ -8,13 +8,25 @@ private const val TAG = "LANTERN"
  * One-shot **batch** reconstruction for directed-capture mode: a handful of deliberately-framed
  * keyframes (full-res color + ARCore pose + ARCore depth + intrinsics) are captured first, then this
  * replays them all at once into a single **point cloud**: DA3 dense depth → FastSAM object mask →
- * **one global** disparity→metric scale (robust median across frames) → back-project every masked
- * pixel with its ARCore pose → merge across views (voxel dedup).
+ * **per-frame** disparity→metric scale (each frame anchored to its own ARCore depth) → back-project
+ * every masked pixel with its ARCore pose → merge across views (voxel dedup).
+ *
+ * Why per-frame scale, not one global scale: DA3 predicts only *relative*, per-image-normalized
+ * disparity, so the disparity→metric mapping genuinely differs frame-to-frame (the same object at the
+ * same distance can have very different raw disparity depending on what else is in view). Forcing one
+ * global scale therefore mis-sizes most views, so even with a perfect SAM mask the per-view clouds
+ * land at inconsistent depths and the merged shape is warped (or culled away by the ground/sphere
+ * gates). Because each keyframe carries its own metric ARCore depth, we instead anchor every frame to
+ * *itself*: one good frame already reconstructs its visible surface correctly, and extra frames add
+ * coverage that actually aligns. (The live-streaming path locks ONE scale on purpose — that's to stop
+ * a single TSDF grid from temporally smearing as the fit jitters; it doesn't apply here, where each
+ * frame contributes independent world-space points.) A frame whose own object fit fails falls back to
+ * a coherent global scale (the median *frame's* (s,t) pair, chosen jointly — not independent medians).
  *
  * Why a point cloud, not TSDF marching cubes: with only a handful of deliberately-framed shots, every
  * SAM-masked pixel becomes a 3D point, so the full silhouette the segmenter sees is captured directly
  * — TSDF needs many overlapping views to close a watertight surface and tends to drop most of the
- * object from sparse captures. ARCore depth is used *only* to anchor the one global scale (overall
+ * object from sparse captures. ARCore depth is used *only* to anchor the per-frame scale (overall
  * size); all geometry is pure DA3 + ARCore pose.
  *
  * Heavy (DA3 is ~1 s/frame on CPU); run off the main thread.
@@ -42,6 +54,8 @@ class BatchReconstructor(
         val intr: CameraIntrinsics,
         val camToWorld: FloatArray,
         val groundY: Float?,
+        /** This frame's own object-anchored DA3 scale; null if its fit failed (use the global one). */
+        val affine: AffineScaleSolver.Affine?,
     )
 
     /** Progress callback: (framesDone, framesTotal, humanLabel). */
@@ -62,10 +76,9 @@ class BatchReconstructor(
         val total = frames.size
         if (total == 0) return MeshData.EMPTY
 
-        // Pass 1: DA3 + SAM + a per-frame scale candidate.
+        // Pass 1: DA3 + SAM + a per-frame, object-anchored scale.
         val prepared = ArrayList<Prepared>(total)
-        val candS = ArrayList<Float>(total)
-        val candT = ArrayList<Float>(total)
+        val objAffines = ArrayList<AffineScaleSolver.Affine>(total)
         for ((i, f) in frames.withIndex()) {
             progress?.update(i, total, "Analyzing ${i + 1}/$total")
             val dw = f.depth.width
@@ -78,38 +91,53 @@ class BatchReconstructor(
                 continue
             }
             val focus = maskedMedianDepth(f.depth, mask)
-            val cand = AffineScaleSolver.fitAffine(disp, f.depth, focusDepthM = focus, mask = mask)
-            if (cand != null && cand.s > 0f && cand.s.isFinite() && cand.t.isFinite()) {
-                candS.add(cand.s)
-                candT.add(cand.t)
-            }
+            // Anchor THIS frame's DA3 depth to ITS OWN ARCore depth over the object region. DA3
+            // disparity is per-image normalized, so a per-frame fit is metrically correct for the
+            // view; a single shared scale would mis-size most views and warp the merged cloud.
+            val aff = AffineScaleSolver.fitObjectAffine(disp, f.depth, focus, mask)
+                ?.takeIf { it.s > 0f && it.s.isFinite() && it.t.isFinite() }
+            if (aff != null) objAffines.add(aff)
             prepared.add(
-                Prepared(disp, mask, dw, dh, intr, Mat4.fromColumnMajor(f.poseColumnMajor), f.groundY),
+                Prepared(disp, mask, dw, dh, intr, Mat4.fromColumnMajor(f.poseColumnMajor), f.groundY, aff),
             )
         }
-        if (prepared.isEmpty() || candS.isEmpty()) {
-            Log.w(TAG, "BatchReconstructor: no usable frames/scale (prepared=${prepared.size}, cand=${candS.size})")
+        if (prepared.isEmpty()) {
+            Log.w(TAG, "BatchReconstructor: no usable frames")
             return MeshData.EMPTY
         }
 
-        // One global scale for the whole capture: robust median over per-frame fits. Order-independent
-        // and immune to a few degenerate frames (flat ARCore depth → near-zero/negative s, already
-        // filtered above), so every view registers at the same metric size. ARCore depth only sets
-        // the *scale* here; all geometry below is pure DA3.
-        val scale = AffineScaleSolver.Affine(median(candS), median(candT))
-        Log.i(TAG, "BatchReconstructor: global scale s=${scale.s} t=${scale.t} from ${candS.size}/${total} frames")
-
-        // Locate the object so we can reject stray background points far from it.
-        var ctr: FloatArray? = null
-        for (p in prepared) {
-            val md = AffineScaleSolver.applyAffine(p.disp, p.depthW, p.depthH, scale)
-            ctr = maskedCentroidWorld(md, p.intr, p.mask, p.camToWorld) ?: continue
-            break
+        // Coherent global scale, used only as the fallback for frames whose own object fit failed.
+        // It's the median *frame's* (s,t) pair chosen jointly (sort by s, take the middle pair) — NOT
+        // median(s) paired with median(t) independently. s and t are correlated regression
+        // coefficients; mixing medians from different frames yields a line that fits no frame at all.
+        val globalScale: AffineScaleSolver.Affine? =
+            if (objAffines.isEmpty()) null else objAffines.sortedBy { it.s }[objAffines.size / 2]
+        if (prepared.all { it.affine == null } && globalScale == null) {
+            Log.w(TAG, "BatchReconstructor: no usable scale on any frame")
+            return MeshData.EMPTY
         }
-        val c = ctr ?: run {
+        Log.i(TAG, "BatchReconstructor: per-frame scale on ${objAffines.size}/${prepared.size} frames; " +
+            "global fallback s=${globalScale?.s} t=${globalScale?.t}")
+
+        // Per-frame scale: this frame's own object fit, else the coherent global fallback.
+        fun scaleFor(p: Prepared): AffineScaleSolver.Affine? = p.affine ?: globalScale
+
+        // Locate the object (to reject stray background points) from the *median* of each frame's
+        // masked centroid under its own scale — robust to a single off frame, unlike taking the first.
+        val cxs = ArrayList<Float>(prepared.size)
+        val cys = ArrayList<Float>(prepared.size)
+        val czs = ArrayList<Float>(prepared.size)
+        for (p in prepared) {
+            val sc = scaleFor(p) ?: continue
+            val md = AffineScaleSolver.applyAffine(p.disp, p.depthW, p.depthH, sc)
+            val pc = maskedCentroidWorld(md, p.intr, p.mask, p.camToWorld) ?: continue
+            cxs.add(pc[0]); cys.add(pc[1]); czs.add(pc[2])
+        }
+        if (cxs.isEmpty()) {
             Log.w(TAG, "BatchReconstructor: could not locate object centroid")
             return MeshData.EMPTY
         }
+        val c = floatArrayOf(median(cxs), median(cys), median(czs))
 
         // Pass 2: back-project every SAM-masked pixel's DA3 depth into world space and merge across
         // views. This is the "take all the depth inside the SAM area" approach — every masked pixel
@@ -121,7 +149,8 @@ class BatchReconstructor(
         val wp = FloatArray(3)
         outer@ for ((i, p) in prepared.withIndex()) {
             progress?.update(i, total, "Fusing ${i + 1}/$total")
-            val md = AffineScaleSolver.applyAffine(p.disp, p.depthW, p.depthH, scale)
+            val sc = scaleFor(p) ?: continue
+            val md = AffineScaleSolver.applyAffine(p.disp, p.depthW, p.depthH, sc)
             val d = md.depthMeters
             val w = p.depthW
             val h = p.depthH

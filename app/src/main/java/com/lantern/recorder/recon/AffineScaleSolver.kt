@@ -79,6 +79,29 @@ object AffineScaleSolver {
     }
 
     /**
+     * Fit a per-frame affine anchored to the **object** only (mask + focus band), with **no
+     * full-frame fallback**. Used by the batch/directed reconstructor, where each deliberately-framed
+     * keyframe is scaled to *its own* ARCore depth (DA3 disparity is per-image normalized, so the
+     * disparity->metric map genuinely differs frame-to-frame — one global scale mis-sizes most views).
+     *
+     * Order: (mask + focus band) -> (mask only). Deliberately omits the background/full-frame fits
+     * that [fitAffine] adds, because a background-anchored scale would misscale the object. Returns
+     * null if the object region has too few overlapping ARCore samples to fit — the caller then falls
+     * back to a coherent global scale for that frame.
+     */
+    fun fitObjectAffine(
+        disp: DisparityMap,
+        metric: DepthMap,
+        focusDepthM: Float?,
+        mask: FloatArray?,
+        confThreshold: Float = 0.5f,
+    ): Affine? {
+        val dispAtMetric = resizeNearest(disp, metric.width, metric.height)
+        return solve(dispAtMetric, metric, confThreshold, focusDepthM, mask)
+            ?: solve(dispAtMetric, metric, confThreshold, null, mask)
+    }
+
+    /**
      * Apply a **fixed** affine `(s, t)` to DA3 disparity, producing a dense metric depth map (meters,
      * 0 = invalid) at [w]x[h]. Unlike [buildMetricDepth], no ARCore depth *values* enter the geometry
      * here — the scale is supplied externally (a locked global scale), so the surface is pure DA3.
