@@ -171,13 +171,6 @@ class LiveReconstructor(
             null
         }
 
-        // Refine the SAM mask against ARCore depth: drop masked pixels whose (valid) depth is far
-        // from the object's distance. Removes floor caught by a slight mask/registration offset or
-        // the base rim, while keeping object pixels (in-band, or with no ARCore depth) intact.
-        if (mask != null && focusDepth != null) {
-            refineMaskByDepth(mask, arcoreMetric, focusDepth)
-        }
-
         if (debugEnabled && argb != null) {
             captureDebug(argb, arcoreMetric, mask, focusDepth)
         }
@@ -292,25 +285,6 @@ class LiveReconstructor(
         latestDebugFrame = DebugFrame(out, w, h, text)
     }
 
-    /**
-     * Refines [mask] in place against ARCore depth: clears any masked pixel whose *valid* depth is
-     * farther than [MASK_REFINE_TOL] (fractional) from the object's distance [focusDepth]. Pixels
-     * with no ARCore depth (0 / out of range) are kept — a dark/textureless object often has sparse
-     * depth, so we must not erase it. This trims floor/background caught by a slight mask or
-     * color↔depth registration offset and the base rim, while leaving the object intact.
-     */
-    private fun refineMaskByDepth(mask: FloatArray, depth: DepthMap, focusDepth: Float) {
-        val d = depth.depthMeters
-        val n = minOf(d.size, mask.size)
-        val tol = focusDepth * MASK_REFINE_TOL
-        for (i in 0 until n) {
-            if (mask[i] < 0.5f) continue
-            val v = d[i]
-            if (v <= 0f || v >= 5f) continue // no reliable depth here — keep (could be the object)
-            if (abs(v - focusDepth) > tol) mask[i] = 0f
-        }
-    }
-
     /** Median depth (m) over the masked (object) pixels — for the bad-mask depth-consistency gate. */
     private fun maskedMedianDepth(depth: DepthMap, mask: FloatArray): Float? {
         val d = depth.depthMeters
@@ -394,10 +368,5 @@ class LiveReconstructor(
         // Skip a frame when the masked region's median depth differs from the centered object's by
         // more than this fraction — i.e. the mask grabbed the floor/background, not the object.
         private const val MASK_DEPTH_TOL = 0.25f
-
-        // Per-pixel mask refinement: drop a masked pixel whose valid ARCore depth differs from the
-        // object's distance by more than this fraction. Tighter than MASK_DEPTH_TOL since it's
-        // trimming individual floor pixels (registration offset / base rim), not whole frames.
-        private const val MASK_REFINE_TOL = 0.12f
     }
 }
