@@ -1,5 +1,10 @@
 # Phase A — Live Point-Cloud Feed (build spec)
 
+> ⚠️ **SUPERSEDED (2026-06-28).** Written before I saw the team's shipped on-device live
+> mesh. The live mesh feed is **already built** — see `LIVE_MESH_PLAN.md` §15 and
+> `docs/LIVE_MESH_DEMO_HANDOFF.md`. Kept only for the model-free point-cloud *export* idea.
+
+
 **What:** the reconstruction materializing **on the phone screen in real time** as you sweep —
 a growing colored point cloud, accumulated in ARCore world space. **No neural model, no laptop,
 no Aiyan dependency.** Pure ARCore raw depth + pose + GPU render. This is the demo's "it's alive"

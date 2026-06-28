@@ -1,5 +1,10 @@
 # Live Mesh Feed — Scoping
 
+> ⚠️ **SUPERSEDED (2026-06-28).** Written before I saw the team's shipped on-device live
+> mesh. The live mesh feed is **already built** — see `LIVE_MESH_PLAN.md` §15 and
+> `docs/LIVE_MESH_DEMO_HANDOFF.md`. Kept only for the model-free point-cloud *export* idea.
+
+
 **Goal:** show the reconstruction **growing on the phone screen in real time as you sweep**,
 instead of today's record → offline-reconstruct → view. This is the demo's "wow" (deck slide 5).
 
