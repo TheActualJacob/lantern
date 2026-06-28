@@ -40,6 +40,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.res.painterResource
@@ -277,8 +278,11 @@ private fun Wireframe3DSurface(modifier: Modifier = Modifier, mesh: MeshData? = 
     var dragYaw by remember { mutableFloatStateOf(0f) }
     var dragPitch by remember { mutableFloatStateOf(0.5f) }
 
+    // Surface meshes (e.g. the convex-hull fill) carry triangles — render them filled. Point-cloud
+    // results (no triangles) fall back to the depth-shaded dot rendering below.
+    val surface: NormalizedMesh? = remember(mesh) { mesh?.takeIf { it.triangleCount > 0 }?.let { normalizedMesh(it, MAX_VIEW_TRIS) } }
     // Centered + unit-normalized + subsampled point cloud, computed once per mesh.
-    val points: FloatArray? = remember(mesh) { mesh?.let { normalizedPoints(it, MAX_VIEW_POINTS) } }
+    val points: FloatArray? = remember(mesh) { if (mesh != null && mesh.triangleCount == 0) normalizedPoints(mesh, MAX_VIEW_POINTS) else null }
 
     Box(
         modifier = modifier
@@ -311,6 +315,57 @@ private fun Wireframe3DSurface(modifier: Modifier = Modifier, mesh: MeshData? = 
                 val z2 = y * sp + z1 * cp
                 val scale = focal / (focal + z2)
                 return Offset(center.x + x1 * scale * radius, center.y - y2 * scale * radius) to z2
+            }
+
+            if (surface != null) {
+                // Surface mesh (hull fill / marching cubes): filled triangles via painter's algorithm
+                // (sort far->near, no z-buffer needed) with two-sided Lambert shading + height hue.
+                val v = surface.verts
+                val idx = surface.indices
+                val nv = v.size / 3
+                // Project + cache rotated 3D (for normals) and screen pos per vertex.
+                val sxArr = FloatArray(nv); val syArr = FloatArray(nv)
+                val rxArr = FloatArray(nv); val ryArr = FloatArray(nv); val rzArr = FloatArray(nv)
+                for (k in 0 until nv) {
+                    val x = v[k * 3]; val y = v[k * 3 + 1]; val z = v[k * 3 + 2]
+                    val x1 = x * cy + z * sy
+                    val z1 = -x * sy + z * cy
+                    val y2 = y * cp - z1 * sp
+                    val z2 = y * sp + z1 * cp
+                    rxArr[k] = x1; ryArr[k] = y2; rzArr[k] = z2
+                    val scale = focal / (focal + z2)
+                    sxArr[k] = center.x + x1 * scale * radius
+                    syArr[k] = center.y - y2 * scale * radius
+                }
+                val nt = idx.size / 3
+                val order = (0 until nt).sortedByDescending { f ->
+                    rzArr[idx[f * 3]] + rzArr[idx[f * 3 + 1]] + rzArr[idx[f * 3 + 2]]
+                }
+                // Light from over the viewer's shoulder (view space).
+                val lx = 0.35f; val ly = 0.45f; val lz = -0.82f
+                for (f in order) {
+                    val a = idx[f * 3]; val b = idx[f * 3 + 1]; val c = idx[f * 3 + 2]
+                    // View-space face normal for shading.
+                    val ux = rxArr[b] - rxArr[a]; val uy = ryArr[b] - ryArr[a]; val uz = rzArr[b] - rzArr[a]
+                    val wx = rxArr[c] - rxArr[a]; val wy = ryArr[c] - ryArr[a]; val wz = rzArr[c] - rzArr[a]
+                    var nx = uy * wz - uz * wy; var ny = uz * wx - ux * wz; var nz = ux * wy - uy * wx
+                    val nl = kotlin.math.sqrt(nx * nx + ny * ny + nz * nz)
+                    if (nl < 1e-9f) continue
+                    nx /= nl; ny /= nl; nz /= nl
+                    val lambert = kotlin.math.abs(nx * lx + ny * ly + nz * lz) // two-sided
+                    val shade = (0.35f + 0.65f * lambert).coerceIn(0f, 1f)
+                    val h = ((ryArr[a] + ryArr[b] + ryArr[c]) / 3f + 1f) / 2f
+                    val col = Color(
+                        red = ((0.30f + 0.55f * h.coerceIn(0f, 1f)) * shade),
+                        green = ((0.55f + 0.30f * (1f - kotlin.math.abs(h - 0.5f) * 2f)) * shade).coerceIn(0f, 1f),
+                        blue = ((0.65f + 0.30f * (1f - h.coerceIn(0f, 1f))) * shade),
+                    )
+                    val path = Path().apply {
+                        moveTo(sxArr[a], syArr[a]); lineTo(sxArr[b], syArr[b]); lineTo(sxArr[c], syArr[c]); close()
+                    }
+                    drawPath(path, color = col)
+                }
+                return@Canvas
             }
 
             if (points != null) {
@@ -381,6 +436,56 @@ private fun formatMeshDimensions(mesh: MeshData): String {
 
 /** Max points drawn in the viewer; the mesh is strided down to this for smooth interaction. */
 private const val MAX_VIEW_POINTS = 6000
+
+/** Max triangles filled by the software canvas; denser meshes are decimated for smooth interaction. */
+private const val MAX_VIEW_TRIS = 12000
+
+/** Normalized surface mesh for the viewer: unit-fit vertices (flat xyz) + triangle indices. */
+private class NormalizedMesh(val verts: FloatArray, val indices: IntArray)
+
+/**
+ * Center + unit-normalize a triangle mesh's vertices (so it fits a unit cube) and decimate to at
+ * most [triBudget] triangles (stride whole faces) so the Compose software canvas stays smooth.
+ * Returns null if the mesh has no triangles.
+ */
+private fun normalizedMesh(mesh: MeshData, triBudget: Int): NormalizedMesh? {
+    if (mesh.triangleCount == 0) return null
+    val v = mesh.vertices
+    var minX = Float.MAX_VALUE; var minY = Float.MAX_VALUE; var minZ = Float.MAX_VALUE
+    var maxX = -Float.MAX_VALUE; var maxY = -Float.MAX_VALUE; var maxZ = -Float.MAX_VALUE
+    var i = 0
+    while (i < v.size) {
+        val x = v[i]; val y = v[i + 1]; val z = v[i + 2]
+        if (x < minX) minX = x; if (x > maxX) maxX = x
+        if (y < minY) minY = y; if (y > maxY) maxY = y
+        if (z < minZ) minZ = z; if (z > maxZ) maxZ = z
+        i += 3
+    }
+    val cx = (minX + maxX) / 2f; val cy = (minY + maxY) / 2f; val cz = (minZ + maxZ) / 2f
+    val half = maxOf(maxX - minX, maxY - minY, maxZ - minZ) / 2f
+    val inv = if (half > 1e-6f) 1f / half else 1f
+    val nv = FloatArray(v.size)
+    var j = 0
+    while (j < v.size) {
+        nv[j] = (v[j] - cx) * inv; nv[j + 1] = (v[j + 1] - cy) * inv; nv[j + 2] = (v[j + 2] - cz) * inv
+        j += 3
+    }
+    val src = mesh.indices
+    val nt = src.size / 3
+    val indices = if (nt <= triBudget) {
+        src
+    } else {
+        val step = (nt + triBudget - 1) / triBudget
+        val out = ArrayList<Int>(triBudget * 3)
+        var f = 0
+        while (f < nt) {
+            out.add(src[f * 3]); out.add(src[f * 3 + 1]); out.add(src[f * 3 + 2])
+            f += step
+        }
+        out.toIntArray()
+    }
+    return NormalizedMesh(nv, indices)
+}
 
 /**
  * Center a mesh's vertices on their bounding-box midpoint and scale by the inverse of the
