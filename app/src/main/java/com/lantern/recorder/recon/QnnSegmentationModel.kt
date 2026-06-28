@@ -33,6 +33,14 @@ class QnnSegmentationModel private constructor(
 ) {
     @Volatile private var closed = false
 
+    /** Debug: highest object score over all anchors last frame (is FastSAM detecting anything?). */
+    @Volatile var lastMaxScore = 0f
+        private set
+
+    /** Debug: fraction of the 160x160 mask set for the chosen object last frame. */
+    @Volatile var lastCoverage = 0f
+        private set
+
     /**
      * Object mask aligned to a depth image of [outW]x[outH] (1f = object, 0f = background), or null
      * if nothing confident is under the center. [argbW]/[argbH] are the source color-image dims
@@ -50,8 +58,13 @@ class QnnSegmentationModel private constructor(
             val protos = outputs[idxProtos]   // [160,160,32] HWC
             val coeffs = outputs[idxCoeffs]   // [8400,32]
             val scores = outputs[idxScores]   // [8400]
-            val best = pickCenterAnchor(protos, coeffs, scores) ?: return null
+            val best = pickCenterAnchor(protos, coeffs, scores)
+            if (best < 0) { lastCoverage = 0f; return null }
             val mask160 = anchorMask(protos, coeffs, best)
+            keepLargestComponent(mask160, PROTO, PROTO) // drop disconnected edge-noise islands
+            var set = 0
+            for (m in mask160) if (m > 0f) set++
+            lastCoverage = set.toFloat() / mask160.size
             sampleToDepth(mask160, lb, outW, outH)
         } catch (t: Throwable) {
             Log.e(TAG, "FastSAM segmentation failed", t)
@@ -90,14 +103,16 @@ class QnnSegmentationModel private constructor(
     }
 
     /** Anchor whose mask is strongest at the center proto pixel (the object you're pointing at). */
-    private fun pickCenterAnchor(protos: FloatArray, coeffs: FloatArray, scores: FloatArray): Int? {
+    private fun pickCenterAnchor(protos: FloatArray, coeffs: FloatArray, scores: FloatArray): Int {
         val cx = PROTO / 2
         val cy = PROTO / 2
         val base = (cy * PROTO + cx) * PROTO_C
         var bestIdx = -1
         var bestKey = 0f
+        var maxScore = 0f
         for (a in 0 until NUM_ANCHORS) {
             val s = scores[a]
+            if (s > maxScore) maxScore = s
             if (s < SCORE_THRESH) continue
             var dot = 0f
             val cb = a * PROTO_C
@@ -107,7 +122,8 @@ class QnnSegmentationModel private constructor(
             val key = s * m
             if (key > bestKey) { bestKey = key; bestIdx = a }
         }
-        return if (bestIdx >= 0) bestIdx else null
+        lastMaxScore = maxScore
+        return bestIdx
     }
 
     /** Assemble the binary 160x160 mask for one anchor: sigmoid(coeffs·protos) > MASK_THRESH. */
@@ -123,6 +139,36 @@ class QnnSegmentationModel private constructor(
             }
         }
         return mask
+    }
+
+    /** Keep only the largest 4-connected blob of [mask] (in place); zero the rest. */
+    private fun keepLargestComponent(mask: FloatArray, w: Int, h: Int) {
+        val labels = IntArray(w * h) { -1 }
+        val stack = IntArray(w * h)
+        var bestLabel = -1
+        var bestSize = 0
+        var label = 0
+        for (start in mask.indices) {
+            if (mask[start] <= 0f || labels[start] != -1) continue
+            var sp = 0
+            stack[sp++] = start
+            labels[start] = label
+            var size = 0
+            while (sp > 0) {
+                val p = stack[--sp]
+                size++
+                val x = p % w
+                val y = p / w
+                if (x > 0 && mask[p - 1] > 0f && labels[p - 1] == -1) { labels[p - 1] = label; stack[sp++] = p - 1 }
+                if (x < w - 1 && mask[p + 1] > 0f && labels[p + 1] == -1) { labels[p + 1] = label; stack[sp++] = p + 1 }
+                if (y > 0 && mask[p - w] > 0f && labels[p - w] == -1) { labels[p - w] = label; stack[sp++] = p - w }
+                if (y < h - 1 && mask[p + w] > 0f && labels[p + w] == -1) { labels[p + w] = label; stack[sp++] = p + w }
+            }
+            if (size > bestSize) { bestSize = size; bestLabel = label }
+            label++
+        }
+        if (bestLabel < 0) return
+        for (i in mask.indices) if (labels[i] != bestLabel) mask[i] = 0f
     }
 
     /** Resample the proto-space mask into a depth image of [outW]x[outH] via the letterbox map. */

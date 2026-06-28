@@ -207,6 +207,24 @@ class CaptureUiState {
         liveMeshDepthBackend = depthBackend
     }
 
+    /** Debug overlay: a live thumbnail (camera + object mask) and a stats string. Toggled by tap. */
+    var liveMeshDebug by mutableStateOf(false)
+        private set
+    var liveMeshDebugBitmap by mutableStateOf<android.graphics.Bitmap?>(null)
+        private set
+    var liveMeshDebugText by mutableStateOf("")
+        private set
+
+    fun toggleLiveMeshDebug() {
+        liveMeshDebug = !liveMeshDebug
+        if (!liveMeshDebug) liveMeshDebugBitmap = null
+    }
+
+    fun onLiveMeshDebug(bmp: android.graphics.Bitmap?, text: String) {
+        liveMeshDebugBitmap = bmp
+        liveMeshDebugText = text
+    }
+
     fun onDepthResolved(supported: Boolean) {
         depthSupported = supported
         // Don't clobber an active recording / error message with the idle depth state.

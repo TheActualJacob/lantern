@@ -72,11 +72,14 @@ class TsdfVolume(
         mask: FloatArray? = null,
     ) {
         if (!centered) return
-        val cullBelowY = groundY?.let { it + GROUND_MARGIN }
-        // Vertical-cylinder cull around the object's center axis (removes surrounding floor).
+        // When a segmentation mask is supplied it IS the object filter, so the coarse geometric
+        // culls (which can clip the object or, if ARCore locks the object's own top face as the
+        // "ground", delete it entirely) are disabled — the mask alone decides what's the object.
+        val maskActive = mask != null
+        val cullBelowY = if (maskActive) null else groundY?.let { it + GROUND_MARGIN }
         val centerX = origin[0] + halfExtent
         val centerZ = origin[2] + halfExtent
-        val radius2 = if (objectRadius > 0f) objectRadius * objectRadius else Float.MAX_VALUE
+        val radius2 = if (!maskActive && objectRadius > 0f) objectRadius * objectRadius else Float.MAX_VALUE
         val worldToCamCv = Mat4.multiply(flip, Mat4.invertRigid(cameraToWorld))
         val fx = intrinsics.fx
         val fy = intrinsics.fy

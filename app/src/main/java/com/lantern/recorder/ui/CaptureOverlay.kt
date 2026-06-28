@@ -17,6 +17,7 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -69,6 +70,9 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import com.lantern.recorder.R
 import com.lantern.recorder.recon.DepthBackendKind
 import com.lantern.recorder.ui.theme.LanternNavy
@@ -92,6 +96,7 @@ fun CaptureOverlay(
     turntableAvailable: Boolean,
     onOpenSessions: () -> Unit,
     onOpenHelp: () -> Unit,
+    onToggleDebug: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     Box(modifier = modifier.fillMaxSize()) {
@@ -161,8 +166,19 @@ fun CaptureOverlay(
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
                     .windowInsetsPadding(WindowInsets.navigationBars)
-                    .padding(end = 24.dp, bottom = 44.dp),
+                    .padding(end = 24.dp, bottom = 44.dp)
+                    .clickable { onToggleDebug() }, // tap to toggle the segmentation debug view
             )
+            if (state.liveMeshDebug) {
+                LiveMeshDebugPanel(
+                    bitmap = state.liveMeshDebugBitmap,
+                    text = state.liveMeshDebugText,
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .windowInsetsPadding(WindowInsets.statusBars)
+                        .padding(start = 12.dp, top = 96.dp),
+                )
+            }
         }
 
         // The shutter is blocked mid-flip (object being handled); in ReadyForPassTwo it
@@ -761,6 +777,42 @@ private fun LiveMeshStatsChip(
                 style = MaterialTheme.typography.labelLarge,
                 fontWeight = FontWeight.Medium,
                 modifier = Modifier.clearAndSetSemantics {},
+            )
+        }
+    }
+}
+
+/** Debug overlay (tap the stats chip to toggle): camera-at-depth-res with the object mask tinted
+ *  green, plus pipeline stats — to see what segmentation/depth are actually producing. */
+@Composable
+private fun LiveMeshDebugPanel(
+    bitmap: android.graphics.Bitmap?,
+    text: String,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        color = Color.Black.copy(alpha = 0.6f),
+        contentColor = Color.White,
+        shape = RoundedCornerShape(10.dp),
+        modifier = modifier,
+    ) {
+        Column(modifier = Modifier.padding(8.dp)) {
+            if (bitmap != null) {
+                Image(
+                    bitmap = bitmap.asImageBitmap(),
+                    contentDescription = "Live mesh debug view",
+                    filterQuality = FilterQuality.None,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier
+                        .widthIn(max = 180.dp)
+                        .clip(RoundedCornerShape(6.dp)),
+                )
+            }
+            Text(
+                text = text,
+                style = MaterialTheme.typography.labelSmall,
+                color = Color(0xFF9BE7A0),
+                modifier = Modifier.padding(top = 6.dp),
             )
         }
     }

@@ -61,6 +61,14 @@ class LiveReconstructor(
     /** Consecutive keyframes the look-target has been far from the current anchor (re-lock debounce). */
     private var reanchorStreak = 0
 
+    @Volatile var debugEnabled = false
+    @Volatile private var latestDebugFrame: DebugFrame? = null
+
+    /** A debug snapshot for the on-screen overlay: a small thumbnail (camera + mask tint) + stats. */
+    class DebugFrame(val argb: IntArray, val width: Int, val height: Int, val text: String)
+
+    fun latestDebug(): DebugFrame? = latestDebugFrame
+
     /** Which dense-depth runtime is live (for the UI readout); ARCORE when no model loaded. */
     val depthBackend: DepthBackendKind get() = depth?.kind ?: DepthBackendKind.ARCORE
 
@@ -157,6 +165,10 @@ class LiveReconstructor(
             null
         }
 
+        if (debugEnabled && argb != null) {
+            captureDebug(argb, arcoreMetric, mask, focusDepth)
+        }
+
         // Prefer DA3 dense metric depth (scaled vs ARCore) when available.
         var fusionDepth = arcoreMetric
         if (argb != null && depth != null) {
@@ -209,6 +221,46 @@ class LiveReconstructor(
         val dy = centroid[1] - (volume.origin[1] + half)
         val dz = centroid[2] - (volume.origin[2] + half)
         return dx * dx + dy * dy + dz * dz > REANCHOR_DIST_M * REANCHOR_DIST_M
+    }
+
+    /** Builds the debug thumbnail (camera at depth-res, object mask tinted green) + a stats string. */
+    private fun captureDebug(
+        argb: ImageUtils.Argb,
+        depthMap: DepthMap,
+        mask: FloatArray?,
+        focusDepth: Float?,
+    ) {
+        val w = depthMap.width
+        val h = depthMap.height
+        val out = IntArray(w * h)
+        for (dy in 0 until h) {
+            val sy = ((dy + 0.5f) / h * argb.height).toInt().coerceIn(0, argb.height - 1)
+            for (dx in 0 until w) {
+                val sx = ((dx + 0.5f) / w * argb.width).toInt().coerceIn(0, argb.width - 1)
+                var p = argb.pixels[sy * argb.width + sx]
+                val i = dy * w + dx
+                if (mask != null && mask[i] > 0.5f) {
+                    // Blend toward green where the object mask is set.
+                    val r = ((p shr 16) and 0xFF) / 2
+                    val g = 0x80 + (((p shr 8) and 0xFF) / 2)
+                    val b = (p and 0xFF) / 2
+                    p = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                } else {
+                    p = p or (0xFF shl 24)
+                }
+                out[i] = p
+            }
+        }
+        val coverage = mask?.let { var s = 0; for (v in it) if (v > 0.5f) s++; s.toFloat() / it.size } ?: 0f
+        val text = buildString {
+            append("backend=${depth?.kind ?: DepthBackendKind.ARCORE}  seg=${if (seg != null) "on" else "off"}\n")
+            append("seg.maxScore=${"%.2f".format(seg?.lastMaxScore ?: 0f)}  ")
+            append("objFound=${mask != null}  maskCov=${"%.1f".format(coverage * 100)}%\n")
+            append("focusDepth=${focusDepth?.let { "%.2fm".format(it) } ?: "—"}  ")
+            append("ground=${lastGroundPlaneY?.let { "%.2f".format(it) } ?: "—"}\n")
+            append("centered=${volume.isCentered}  frames=$integratedFrames  depthRes=${w}x$h")
+        }
+        latestDebugFrame = DebugFrame(out, w, h, text)
     }
 
     /** Median depth (m) over the center window of the frame — the distance to the centered object. */

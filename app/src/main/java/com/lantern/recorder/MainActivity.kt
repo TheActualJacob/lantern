@@ -226,6 +226,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                         startActivity(Intent(this, SessionsActivity::class.java))
                     },
                     onOpenHelp = { showCoach = true },
+                    onToggleDebug = { uiState.toggleLiveMeshDebug() },
                 )
                 CoachOverlay(
                     visible = showCoach,
@@ -662,6 +663,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private fun updateLiveMesh(frame: com.google.ar.core.Frame) {
         val recon = liveReconstructor ?: return
         if (uiState.captureMode != CaptureMode.LiveMesh) return
+        recon.debugEnabled = uiState.liveMeshDebug
         val camera = frame.camera
         if (camera.trackingState != TrackingState.TRACKING) return
 
@@ -695,6 +697,16 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             val frames = recon.frameCount
             val backend = recon.depthBackend
             runOnUiThread { uiState.onLiveMeshStats(vertices, frames, backend) }
+
+            if (uiState.liveMeshDebug) {
+                val dbg = recon.latestDebug()
+                val bmp = dbg?.let {
+                    android.graphics.Bitmap.createBitmap(it.argb, it.width, it.height, android.graphics.Bitmap.Config.ARGB_8888)
+                }
+                val track = camera.trackingState
+                val text = (dbg?.text ?: "no keyframe processed yet") + "\ntracking=$track"
+                runOnUiThread { uiState.onLiveMeshDebug(bmp, text) }
+            }
         }
     }
 
