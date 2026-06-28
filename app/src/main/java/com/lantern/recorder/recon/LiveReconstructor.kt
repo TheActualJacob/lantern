@@ -55,6 +55,9 @@ class LiveReconstructor(
     @Volatile private var integratedFrames = 0
     @Volatile private var running = false
 
+    /** Wall-clock time of the last processed frame; drives the warmup poll cadence when stationary. */
+    @Volatile private var lastProcessNs = 0L
+
     /** Latest ARCore support-plane world-Y (object's surface); voxels below it are culled. */
     @Volatile private var lastGroundPlaneY: Float? = null
 
@@ -146,7 +149,13 @@ class LiveReconstructor(
         val camX = cameraToWorld[3]
         val camY = cameraToWorld[7]
         val camZ = cameraToWorld[11]
-        if (!isKeyframe(camX, camY, camZ)) return
+        // Fusion is gated on camera motion (need a fresh viewpoint), but warmup must keep building
+        // evidence even when the user holds still on the object — otherwise no keyframes fire and
+        // the lock never warms up. So while searching, also process on a time cadence.
+        val nowNs = System.nanoTime()
+        val warmingUp = seg != null && lockState == LockState.SEARCHING
+        val pollDue = warmingUp && (nowNs - lastProcessNs) >= WARMUP_POLL_MS * 1_000_000L
+        if (!isKeyframe(camX, camY, camZ) && !pollDue) return
         if (busy.get()) return // worker still chewing the previous keyframe; skip this one
 
         // Acquire metric depth now (Frame is only valid on this thread, this call).
@@ -165,6 +174,7 @@ class LiveReconstructor(
         if (groundPlaneY != null) lastGroundPlaneY = groundPlaneY
 
         lastKeyframePos = floatArrayOf(camX, camY, camZ)
+        lastProcessNs = nowNs
         busy.set(true)
         worker.execute {
             try {
@@ -512,6 +522,9 @@ class LiveReconstructor(
         private const val WARMUP_DECAY = 1.0f
         // Cap on a single frame's evidence credit, so a long out-of-view gap can't dump score.
         private const val WARMUP_DT_CAP_MS = 300f
+        // While warming up, process at least this often (ms) even with no camera motion, so holding
+        // still on the object still builds warmup evidence. Fusion stays motion-gated as before.
+        private const val WARMUP_POLL_MS = 150L
         // Unlock: once we've been off the locked object this long, the lock was wrong (or the object
         // left) — tear the mesh down and re-search, so a bad (e.g. floor) lock can't live forever.
         private const val UNLOCK_MS = 3_000L
