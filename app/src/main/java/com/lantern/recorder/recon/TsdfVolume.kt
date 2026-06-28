@@ -128,15 +128,19 @@ class TsdfVolume(
                     val dz = d[pix]
                     // The segmentation mask IS the object filter. A voxel projecting onto a
                     // background (non-object) pixel is not just skipped — it's *carved*: its weight
-                    // is bled off and, once gone, its TSDF reset to empty, so a region SAM has
+                    // is bled off and, once gone, its TSDF reset to empty, so background the mask has
                     // stopped reporting fades out of the mesh instead of persisting forever (the
-                    // additive TSDF would otherwise keep any background it ever saw). Only carve
-                    // voxels we can actually see this frame — at or in front of the observed surface
-                    // (within the truncation band) — so geometry occluded behind a surface, and
-                    // pixels with no depth, are left untouched and never erode the real object.
+                    // additive TSDF would otherwise keep any background it ever saw).
+                    //
+                    // Carve ONLY clear free space — a voxel sitting well in front of the observed
+                    // surface (camZ < dz - sdfTrunc), i.e. somewhere we can plainly see *through*.
+                    // Voxels at/near a surface (camZ ~= dz) are left alone even when masked out:
+                    // they may be the real object that SAM under-segmented this frame, so carving
+                    // them would chew holes in the reconstruction. Occluded voxels (behind the
+                    // surface) and depth-less pixels are also left untouched.
                     if (mask != null && pix < mask.size && mask[pix] < 0.5f) {
                         val ci = jBase + i
-                        if (weight[ci] > 0f && dz > 0f && camZ <= dz + sdfTrunc) {
+                        if (weight[ci] > 0f && dz > 0f && camZ < dz - sdfTrunc) {
                             val wNew = weight[ci] - CARVE_RATE
                             if (wNew <= 0f) {
                                 weight[ci] = 0f
