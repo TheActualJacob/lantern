@@ -180,6 +180,16 @@ class LiveReconstructor(
         // ungated and stick in the volume. Only frames with an object mask contribute.
         if (seg != null && mask == null) return
 
+        // Reject bad-mask frames: when FastSAM momentarily grabs the floor/background instead of
+        // the centered object, the masked region sits at a different distance than the object
+        // (focusDepth). Skip those so transient garbage never bakes into the (permanent) TSDF.
+        if (mask != null && focusDepth != null) {
+            val maskDepth = maskedMedianDepth(arcoreMetric, mask)
+            if (maskDepth != null && kotlin.math.abs(maskDepth - focusDepth) / focusDepth > MASK_DEPTH_TOL) {
+                return
+            }
+        }
+
         // Prefer DA3 dense metric depth (scaled vs ARCore) when available.
         var fusionDepth = arcoreMetric
         if (argb != null && depth != null) {
@@ -275,6 +285,21 @@ class LiveReconstructor(
         latestDebugFrame = DebugFrame(out, w, h, text)
     }
 
+    /** Median depth (m) over the masked (object) pixels — for the bad-mask depth-consistency gate. */
+    private fun maskedMedianDepth(depth: DepthMap, mask: FloatArray): Float? {
+        val d = depth.depthMeters
+        val samples = ArrayList<Float>()
+        val n = minOf(d.size, mask.size)
+        for (i in 0 until n) {
+            if (mask[i] < 0.5f) continue
+            val v = d[i]
+            if (v > 0f && v < 5f) samples.add(v)
+        }
+        if (samples.size < 8) return null
+        samples.sort()
+        return samples[samples.size / 2]
+    }
+
     /** Median depth (m) over the center window of the frame — the distance to the centered object. */
     private fun centerMedianDepth(depth: DepthMap): Float? {
         val cw = depth.width / 4
@@ -339,5 +364,9 @@ class LiveReconstructor(
         // never wipes the accumulating scan; only genuinely moving to a new object/area resets.
         private const val REANCHOR_DIST_M = 0.45f
         private const val REANCHOR_FRAMES = 8
+
+        // Skip a frame when the masked region's median depth differs from the centered object's by
+        // more than this fraction — i.e. the mask grabbed the floor/background, not the object.
+        private const val MASK_DEPTH_TOL = 0.25f
     }
 }
