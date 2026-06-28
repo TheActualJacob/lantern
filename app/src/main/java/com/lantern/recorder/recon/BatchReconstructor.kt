@@ -145,6 +145,7 @@ class BatchReconstructor(
         // marching cubes, which needs many views to close a surface). A voxel grid dedups overlap.
         val seen = HashSet<Long>(1 shl 16)
         val verts = ArrayList<Float>(1 shl 16)
+        val vertKeys = ArrayList<Long>(1 shl 16) // voxel key per emitted point, for the density filter
         val r2 = OBJECT_RADIUS * OBJECT_RADIUS
         val wp = FloatArray(3)
         outer@ for ((i, p) in prepared.withIndex()) {
@@ -173,8 +174,10 @@ class BatchReconstructor(
                 if (groundCut != null && py < groundCut) continue
                 val dx = px - c[0]; val dy = py - c[1]; val dz = pz - c[2]
                 if (dx * dx + dy * dy + dz * dz > r2) continue
-                if (seen.add(voxelKey(px, py, pz))) {
+                val key = voxelKey(px, py, pz)
+                if (seen.add(key)) {
                     verts.add(px); verts.add(py); verts.add(pz)
+                    vertKeys.add(key)
                     if (verts.size / 3 >= MAX_POINTS) break@outer
                 }
             }
@@ -184,8 +187,19 @@ class BatchReconstructor(
             Log.w(TAG, "BatchReconstructor: too few points (${verts.size / 3})")
             return MeshData.EMPTY
         }
+
+        // Density filter: drop isolated points \u2014 DA3 depth floaters and mask-edge bleed that the
+        // per-frame metric scale doesn't catch. A real surface is locally dense at the 3 mm voxel
+        // grid, so any point whose 26-voxel neighborhood holds fewer than [MIN_NEIGHBOR_VOXELS]
+        // occupied cells is a stray and is removed; the object's silhouette edges keep enough
+        // in-plane neighbors to survive. This is the cleanup that makes the cloud read as the object
+        // rather than a noisy shell.
+        val v = densityFilter(verts, vertKeys, seen)
+        if (v.size / 3 < MIN_POINTS) {
+            Log.w(TAG, "BatchReconstructor: too few points after density filter (${v.size / 3})")
+            return MeshData.EMPTY
+        }
         progress?.update(total, total, "Finishing\u2026")
-        val v = verts.toFloatArray()
         // Point cloud: no triangles. Up-normals keep the renderer's shader happy; the viewer colors
         // by height anyway.
         val normals = FloatArray(v.size) { if (it % 3 == 1) 1f else 0f }
@@ -199,7 +213,39 @@ class BatchReconstructor(
         val ix = Math.round(x * inv) + 524288L // +2^19 bias keeps coords non-negative within ±5 km
         val iy = Math.round(y * inv) + 524288L
         val iz = Math.round(z * inv) + 524288L
-        return (ix and 0xFFFFF) or ((iy and 0xFFFFF) shl 20) or ((iz and 0xFFFFF) shl 40)
+        return packVoxel(ix, iy, iz)
+    }
+
+    /** Pack already-biased integer voxel coords into the 20-bits-per-axis key (matches [voxelKey]). */
+    private fun packVoxel(ix: Long, iy: Long, iz: Long): Long =
+        (ix and 0xFFFFF) or ((iy and 0xFFFFF) shl 20) or ((iz and 0xFFFFF) shl 40)
+
+    /**
+     * Remove isolated points (DA3 floaters / mask-edge bleed): keep a point only if its 26-voxel
+     * neighborhood contains at least [MIN_NEIGHBOR_VOXELS] other occupied cells. [occupied] is the
+     * dedup set built during back-projection, so this is a pure lookup — no spatial structure to
+     * rebuild. Returns the surviving points as a flat xyz array.
+     */
+    private fun densityFilter(verts: ArrayList<Float>, keys: ArrayList<Long>, occupied: HashSet<Long>): FloatArray {
+        val out = ArrayList<Float>(verts.size)
+        for (k in keys.indices) {
+            val key = keys[k]
+            val ix = key and 0xFFFFF
+            val iy = (key ushr 20) and 0xFFFFF
+            val iz = (key ushr 40) and 0xFFFFF
+            var neighbors = 0
+            loop@ for (dz in -1L..1L) for (dy in -1L..1L) for (dx in -1L..1L) {
+                if (dx == 0L && dy == 0L && dz == 0L) continue
+                if (occupied.contains(packVoxel(ix + dx, iy + dy, iz + dz))) {
+                    if (++neighbors >= MIN_NEIGHBOR_VOXELS) break@loop
+                }
+            }
+            if (neighbors >= MIN_NEIGHBOR_VOXELS) {
+                val b = k * 3
+                out.add(verts[b]); out.add(verts[b + 1]); out.add(verts[b + 2])
+            }
+        }
+        return out.toFloatArray()
     }
 
     /** Median depth (m) over masked pixels (or all valid pixels if no mask); null if too sparse. */
@@ -269,6 +315,10 @@ class BatchReconstructor(
 
         /** Dedup voxel size (m): merges overlapping points across views into one. */
         private const val VOXEL_M = 0.003f
+
+        /** Density filter: min occupied cells in a point's 26-voxel neighborhood to keep it (else a
+         *  stray floater). 2 kills singletons and isolated pairs while sparing silhouette edges. */
+        private const val MIN_NEIGHBOR_VOXELS = 2
 
         /** Hard cap on emitted points so a noisy scan can't OOM the renderer. */
         private const val MAX_POINTS = 400_000
