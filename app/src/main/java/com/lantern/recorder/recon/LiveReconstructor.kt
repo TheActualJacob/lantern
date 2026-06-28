@@ -63,6 +63,7 @@ class LiveReconstructor(
 
     @Volatile var debugEnabled = false
     @Volatile private var latestDebugFrame: DebugFrame? = null
+    @Volatile private var loggedDims = false
 
     /** A debug snapshot for the on-screen overlay: a small thumbnail (camera + mask tint) + stats. */
     class DebugFrame(val argb: IntArray, val width: Int, val height: Int, val text: String)
@@ -152,6 +153,11 @@ class LiveReconstructor(
         cameraToWorld: FloatArray,
     ) {
         val depthIntrinsics = intrinsics.scaledTo(arcoreMetric.width, arcoreMetric.height)
+        if (argb != null && !loggedDims) {
+            loggedDims = true
+            Log.i(TAG, "DIMS depth=${arcoreMetric.width}x${arcoreMetric.height} " +
+                "argb=${argb.width}x${argb.height} intr=${intrinsics.width}x${intrinsics.height}")
+        }
 
         // Distance to whatever's centered in view (the object); used to focus the depth-scale
         // fit on the object instead of the background.
@@ -263,7 +269,8 @@ class LiveReconstructor(
             append("objFound=${mask != null}  maskCov=${"%.1f".format(coverage * 100)}%\n")
             append("focusDepth=${focusDepth?.let { "%.2fm".format(it) } ?: "—"}  ")
             append("ground=${lastGroundPlaneY?.let { "%.2f".format(it) } ?: "—"}\n")
-            append("centered=${volume.isCentered}  frames=$integratedFrames  depthRes=${w}x$h")
+            append("centered=${volume.isCentered}  frames=$integratedFrames\n")
+            append("depth=${w}x$h  argb=${argb.width}x${argb.height}")
         }
         latestDebugFrame = DebugFrame(out, w, h, text)
     }

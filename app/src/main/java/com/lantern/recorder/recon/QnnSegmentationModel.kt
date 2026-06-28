@@ -30,6 +30,7 @@ class QnnSegmentationModel private constructor(
     private val idxProtos: Int,
     private val idxCoeffs: Int,
     private val idxScores: Int,
+    private val idxBoxes: Int,
 ) {
     @Volatile private var closed = false
 
@@ -58,10 +59,12 @@ class QnnSegmentationModel private constructor(
             val protos = outputs[idxProtos]   // [160,160,32] HWC
             val coeffs = outputs[idxCoeffs]   // [8400,32]
             val scores = outputs[idxScores]   // [8400]
-            val best = pickCenterAnchor(protos, coeffs, scores)
+            val boxes = outputs[idxBoxes]     // [8400,4] xyxy in 640-space
+            val best = pickCenterAnchor(protos, coeffs, scores, boxes)
             if (best < 0) { lastCoverage = 0f; return null }
             val mask160 = anchorMask(protos, coeffs, best)
             keepLargestComponent(mask160, PROTO, PROTO) // drop disconnected edge-noise islands
+            erode(mask160, PROTO, PROTO)                 // shed the floor rim at the object's base
             var set = 0
             for (m in mask160) if (m > 0f) set++
             lastCoverage = set.toFloat() / mask160.size
@@ -102,11 +105,16 @@ class QnnSegmentationModel private constructor(
         return out
     }
 
-    /** Anchor whose mask is strongest at the center proto pixel (the object you're pointing at). */
-    private fun pickCenterAnchor(protos: FloatArray, coeffs: FloatArray, scores: FloatArray): Int {
+    /**
+     * Anchor for the object under the screen center: covers the center, scores above threshold,
+     * and isn't a giant region (FastSAM also emits big background/floor masks — skip those by box
+     * area). Among the rest, strongest mask-at-center wins.
+     */
+    private fun pickCenterAnchor(protos: FloatArray, coeffs: FloatArray, scores: FloatArray, boxes: FloatArray): Int {
         val cx = PROTO / 2
         val cy = PROTO / 2
         val base = (cy * PROTO + cx) * PROTO_C
+        val maxBoxArea = MAX_BOX_FRAC * SEG_RES * SEG_RES
         var bestIdx = -1
         var bestKey = 0f
         var maxScore = 0f
@@ -114,6 +122,10 @@ class QnnSegmentationModel private constructor(
             val s = scores[a]
             if (s > maxScore) maxScore = s
             if (s < SCORE_THRESH) continue
+            // Reject background-sized masks (xyxy box area in 640-space).
+            val bb = a * 4
+            val area = kotlin.math.abs(boxes[bb + 2] - boxes[bb]) * kotlin.math.abs(boxes[bb + 3] - boxes[bb + 1])
+            if (area > maxBoxArea) continue
             var dot = 0f
             val cb = a * PROTO_C
             for (c in 0 until PROTO_C) dot += coeffs[cb + c] * protos[base + c]
@@ -124,6 +136,20 @@ class QnnSegmentationModel private constructor(
         }
         lastMaxScore = maxScore
         return bestIdx
+    }
+
+    /** One-ring erosion of a binary mask (in place): clears any set pixel with a clear 4-neighbor. */
+    private fun erode(mask: FloatArray, w: Int, h: Int) {
+        val src = mask.copyOf()
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val i = y * w + x
+                if (src[i] <= 0f) continue
+                val edge = x == 0 || y == 0 || x == w - 1 || y == h - 1 ||
+                    src[i - 1] <= 0f || src[i + 1] <= 0f || src[i - w] <= 0f || src[i + w] <= 0f
+                if (edge) mask[i] = 0f
+            }
+        }
     }
 
     /** Assemble the binary 160x160 mask for one anchor: sigmoid(coeffs·protos) > MASK_THRESH. */
@@ -208,6 +234,9 @@ class QnnSegmentationModel private constructor(
         private const val SCORE_THRESH = 0.4f
         private const val MASK_THRESH = 0.5f
 
+        /** Reject masks whose box covers more than this fraction of the frame (background/floor). */
+        private const val MAX_BOX_FRAC = 0.55f
+
         private fun sigmoid(x: Float): Float = 1f / (1f + exp(-x))
 
         /**
@@ -229,12 +258,13 @@ class QnnSegmentationModel private constructor(
                 val protos = names.indexOfFirst { it.contains("proto") }
                 val coeffs = names.indexOfFirst { it.contains("coeff") }
                 val scores = names.indexOfFirst { it.contains("score") }
-                if (protos < 0 || coeffs < 0 || scores < 0) {
+                val boxes = names.indexOfFirst { it.contains("box") }
+                if (protos < 0 || coeffs < 0 || scores < 0 || boxes < 0) {
                     Log.w(TAG, "FastSAM outputs unexpected: ${names.joinToString()}")
                     QnnNative.nativeClose(handle); return null
                 }
                 Log.i(TAG, "Loaded FastSAM QNN model: $modelPath")
-                QnnSegmentationModel(handle, outElems, protos, coeffs, scores)
+                QnnSegmentationModel(handle, outElems, protos, coeffs, scores, boxes)
             } catch (t: Throwable) {
                 Log.w(TAG, "FastSAM not loaded ($modelPath); ${t.message}")
                 null
