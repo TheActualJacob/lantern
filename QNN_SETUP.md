@@ -1,5 +1,40 @@
 # QNN on-device setup — wiring the QAIRT SDK so the app uses the Hexagon NPU
 
+> ## STATUS (2026-06-27) — wired & building; blocked on SDK version
+> Everything below is **done and verified on the connected S25** EXCEPT the SDK version:
+> - ✅ `local.properties` → `qnn.sdkRoot` points at the SDK; Gradle reads it (`app/build.gradle.kts`).
+> - ✅ NDK `27.0.12077973` + CMake `3.22.1` installed; **`libqnn_depth.so` compiles** against the
+>   real 2.44 headers and is bundled with the 5 Qualcomm `.so`s in the debug APK.
+> - ✅ APK installed, `depth_anything_v3.dlc` pushed to the app's files dir, app finds & loads it.
+> - ✅ At runtime the native lib dlopens the QNN runtime and reads the model — gets all the way to
+>   DLC parse.
+> - ❌ **BLOCKER: version mismatch.** Installed SDK is **2.44.0**; the AI Hub DLC was exported with
+>   **2.45.0** (`metadata.json` / DLC `converterVersion: 2.45.0.260326154327`). 2.44's DLC reader
+>   rejects it: `Failed to create dlc handle with code 1002` → `ComposeGraphs Failed`. On-device
+>   logcat (`LANTERN_QNN`) shows `systemContextGetBinaryInfo failed` → falls back to ARCore.
+>
+> **Fix = match the versions, then re-run:**
+> 1. Download **QAIRT 2.45.0** (same minor as the DLC), unzip, update `qnn.sdkRoot` in
+>    `local.properties`, and re-copy the 5 `.so`s into `app/src/main/jniLibs/arm64-v8a/` from the
+>    2.45 SDK (see step 3). *(Alternative: re-export the DLC from AI Hub targeting QAIRT 2.44.)*
+> 2. The raw `.dlc` still isn't a context binary, so convert it once (the on-device generator is
+>    already staged at `/data/local/tmp/qnn`) — re-push the 2.45 libs there first:
+>    ```
+>    adb shell "cd /data/local/tmp/qnn && LD_LIBRARY_PATH=lib ADSP_LIBRARY_PATH=dsp \
+>      ./qnn-context-binary-generator --backend lib/libQnnHtp.so --model lib/libQnnModelDlc.so \
+>      --dlc_path depth_anything_v3.dlc --binary_file da3_qnn_v79 --output_dir output"
+>    adb push <pull output/da3_qnn_v79.bin> /sdcard/Android/data/com.lantern.recorder/files/da3_qnn_v79.bin
+>    ```
+>    The app prefers `da3_qnn_v79.bin` over the `.dlc`, and `qnn_depth.cpp`'s
+>    `contextCreateFromBinary` path is built for exactly that binary.
+> 3. Relaunch → live-mesh chip should read **`QNN NPU`** (green).
+>
+> If `contextCreateFromBinary` then fails on a struct-version assert, flip the `graphInfoV1` /
+> `Qnn_Tensor_t.v1` branches in `qnn_depth.cpp` to the V2 variants (the other "known unknown").
+
+---
+
+
 You downloaded the QAIRT/QNN SDK zip. This is the checklist to turn the gated QNN depth backend
 on so a plain **Run** in Android Studio uses the AI Hub `depth_anything_v3.dlc` on the S25's
 Hexagon-v79 NPU. The code is already implemented and gated off (see `QNN_RUNTIME_PLAN.md`); this

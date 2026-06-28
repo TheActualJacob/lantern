@@ -76,3 +76,8 @@ demo/frames/
 
 # Qualcomm DLC model asset (143MB, exceeds GitHub limit)
 depth_anything_v3-qnn_dlc-float/
+
+# Qualcomm QAIRT/QNN SDK (3.5GB, licensed) — local only
+qairt/
+# Qualcomm runtime libs (licensed, not redistributable) — copy per QNN_SETUP.md
+app/src/main/jniLibs/arm64-v8a/*.so

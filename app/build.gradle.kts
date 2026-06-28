@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -5,18 +7,26 @@ plugins {
 }
 
 // QNN Hexagon-NPU depth backend (recon/QnnDlcDepthModel.kt + cpp/qnn_depth.cpp) is opt-in: it
-// requires the Qualcomm QAIRT/QNN SDK (for headers) plus the NDK/CMake. Enable by passing
-// `-Pqnn.sdkRoot=/path/to/qairt/2.45.x` or setting the QNN_SDK_ROOT env var. When unset, the
-// native build is skipped entirely so the stock (headless) build needs no NDK, and the app
-// degrades to ExecuTorch/ARCore depth at runtime.
-val qnnSdkRoot: String? =
-    (project.findProperty("qnn.sdkRoot") as String?)?.takeIf { it.isNotBlank() }
-        ?: System.getenv("QNN_SDK_ROOT")?.takeIf { it.isNotBlank() }
+// requires the Qualcomm QAIRT/QNN SDK (for headers) plus the NDK/CMake. Enable by setting
+// `qnn.sdkRoot=/path/to/qairt/2.45.x` in local.properties (machine-specific, gitignored), or via
+// `-Pqnn.sdkRoot=...` / the QNN_SDK_ROOT env var. When unset, the native build is skipped entirely
+// so the stock (headless) build needs no NDK, and the app degrades to ExecuTorch/ARCore at runtime.
+val qnnSdkRoot: String? = run {
+    val fromLocal = rootProject.file("local.properties").takeIf { it.exists() }?.let { f ->
+        Properties().apply { f.inputStream().use { load(it) } }.getProperty("qnn.sdkRoot")
+    }
+    (fromLocal
+        ?: project.findProperty("qnn.sdkRoot") as String?
+        ?: System.getenv("QNN_SDK_ROOT"))?.takeIf { it.isNotBlank() }
+}
 val qnnEnabled = qnnSdkRoot != null
 
 android {
     namespace = "com.lantern.recorder"
     compileSdk = 35
+
+    // Pinned to the NDK installed for the QNN native build (no-op when QNN is disabled).
+    if (qnnEnabled) ndkVersion = "27.0.12077973"
 
     defaultConfig {
         applicationId = "com.lantern.recorder"
