@@ -77,10 +77,10 @@ class LiveReconstructor(
     // The locked object's established distance (LOCKED), tracked as an EMA over consistent frames.
     private var lockedDepth: Float? = null
 
-    // Switch candidate (LOCKED): a new object being considered, and how long it's been held steady.
-    private var switchDepth: Float? = null
-    private var switchCentroid: FloatArray? = null
-    private var switchSinceNs = 0L
+    // Timestamp of the last frame that was actually on the locked object. If we stay off it longer
+    // than [UNLOCK_MS] the lock was wrong (e.g. warmup grabbed the floor) or the object is gone, so
+    // we tear the mesh down and re-search instead of leaving bad geometry baked in forever.
+    private var lastOnLockNs = 0L
 
     @Volatile var debugEnabled = false
     @Volatile private var latestDebugFrame: DebugFrame? = null
@@ -112,9 +112,7 @@ class LiveReconstructor(
             warmupDepth = null
             warmupSinceNs = 0L
             lockedDepth = null
-            switchDepth = null
-            switchCentroid = null
-            switchSinceNs = 0L
+            lastOnLockNs = 0L
             meshRef.set(MeshData.EMPTY)
             versionRef.set(versionRef.get() + 1)
         }
@@ -285,49 +283,44 @@ class LiveReconstructor(
                         volume.centerOn(centroid[0], centroid[1], centroid[2])
                         lockedDepth = warmupDepth
                         integratedFrames = 0
-                        switchDepth = null
-                        switchSinceNs = 0L
+                        lastOnLockNs = now
                         lockState = LockState.LOCKED
                     }
                 }
             }
             LockState.LOCKED -> {
-                if (maskDepth == null || centroid == null) return // can't verify; skip this frame
+                if (maskDepth == null || centroid == null) return // unverifiable; keep lock, don't fuse
                 val ld = lockedDepth
                 val depthOk = ld != null && kotlin.math.abs(maskDepth - ld) / ld <= LOCK_DEPTH_TOL
                 val posOk = !isNewTarget(centroid)
                 if (depthOk && posOk) {
-                    // On the locked object: track its drifting distance, drop any switch attempt, fuse.
+                    // On the locked object: track its drifting distance, refresh the timer, fuse.
                     lockedDepth = ld!! + LOCK_DEPTH_EMA_ALPHA * (maskDepth - ld)
-                    switchDepth = null
-                    switchSinceNs = 0L
+                    lastOnLockNs = now
                     fuse(fusionDepth, depthIntrinsics, cameraToWorld, mask)
-                } else {
-                    // Off the locked object (floor grab or a different place). Don't fuse. Adopt a
-                    // new object only after it's been held steadily for SWITCH_LOCK_MS — a brief
-                    // glitch never accumulates enough, while a deliberate new target does.
-                    val sc = switchDepth
-                    val scCentroid = switchCentroid
-                    val steady = sc != null &&
-                        kotlin.math.abs(maskDepth - sc) / sc <= LOCK_DEPTH_TOL &&
-                        scCentroid != null && dist2(centroid, scCentroid) <= LOCK_DIST_M * LOCK_DIST_M
-                    if (!steady) {
-                        switchDepth = maskDepth
-                        switchCentroid = centroid
-                        switchSinceNs = now
-                    } else if (now - switchSinceNs >= SWITCH_LOCK_MS * 1_000_000L) {
-                        volume.reset()
-                        volume.centerOn(centroid[0], centroid[1], centroid[2])
-                        meshRef.set(MeshData.EMPTY)
-                        versionRef.set(versionRef.get() + 1)
-                        lockedDepth = maskDepth
-                        integratedFrames = 0
-                        switchDepth = null
-                        switchSinceNs = 0L
-                    }
+                } else if (now - lastOnLockNs >= UNLOCK_MS * 1_000_000L) {
+                    // Off the locked object too long: the lock was wrong (warmup grabbed the floor)
+                    // or the object left. Drop the mesh and re-search so bad geometry can't persist.
+                    // A brief excursion (< UNLOCK_MS) is tolerated — the mesh is preserved and this
+                    // frame simply doesn't fuse — so a quick glance away never wipes a good scan.
+                    teardown()
                 }
+                // else: brief excursion — skip this frame, keep the mesh, wait it out.
             }
         }
+    }
+
+    /** Discard the current scan and return to warmup — used when the lock turns out to be wrong. */
+    private fun teardown() {
+        volume.reset()
+        meshRef.set(MeshData.EMPTY)
+        versionRef.set(versionRef.get() + 1)
+        integratedFrames = 0
+        lockState = LockState.SEARCHING
+        warmupDepth = null
+        warmupSinceNs = 0L
+        lockedDepth = null
+        lastOnLockNs = 0L
     }
 
     /** Integrate one frame into the volume and re-mesh on the extract cadence. */
@@ -344,12 +337,6 @@ class LiveReconstructor(
             meshRef.set(mesh)
             versionRef.set(versionRef.get() + 1)
         }
-    }
-
-    /** Squared world distance between two points. */
-    private fun dist2(a: FloatArray, b: FloatArray): Float {
-        val dx = a[0] - b[0]; val dy = a[1] - b[1]; val dz = a[2] - b[2]
-        return dx * dx + dy * dy + dz * dz
     }
 
     /** True if [centroid] is far enough from the current volume center to be a different object. */
@@ -490,17 +477,14 @@ class LiveReconstructor(
         // Object-lock state machine (segmentation mode):
         // Warmup: FastSAM must hold one object at a steady distance this long before anything fuses.
         private const val WARMUP_LOCK_MS = 5_000L
-        // Switch: a new object must be held steadily this long before it replaces the locked one,
-        // so a ~1 s floor grab can never re-lock or leak into the mesh.
-        private const val SWITCH_LOCK_MS = 4_000L
+        // Unlock: once we've been off the locked object this long, the lock was wrong (or the object
+        // left) — tear the mesh down and re-search, so a bad (e.g. floor) lock can't live forever.
+        private const val UNLOCK_MS = 3_000L
         // A frame is "on the locked object" when its mask depth is within this fraction of the
         // locked distance. Keyframes are gated to 2 cm of motion, so a real object drifts only a
         // few percent per frame, while a mask jump to the floor spikes far past this.
         private const val LOCK_DEPTH_TOL = 0.18f
         // EMA smoothing for the locked/warmup distance (higher tracks deliberate motion faster).
         private const val LOCK_DEPTH_EMA_ALPHA = 0.2f
-        // World-space window (m) within which a switch candidate's look point must stay to count as
-        // the same steady new object; a jittering floor grab never holds still inside it.
-        private const val LOCK_DIST_M = 0.30f
     }
 }
