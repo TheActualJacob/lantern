@@ -47,6 +47,11 @@ class LiveReconstructor(
 
     val segActive: Boolean get() = seg != null
 
+    /** Temporal hysteresis over the raw SAM mask: slow to accept new region (suppresses background
+     *  noise), quick to drop a region SAM stops reporting (background removed / different object).
+     *  Touched only on the preview worker. */
+    private val maskStabilizer = MaskStabilizer()
+
     // Two workers, two cadences. [worker] runs the *fast* preview (FastSAM mask + debug overlay,
     // ~tens of ms) every gated frame so the live mask tracks the object in real time. [fusionWorker]
     // runs the *heavy* path (DA3 dense depth ~seconds on CPU + TSDF fusion + marching cubes) and
@@ -137,6 +142,8 @@ class LiveReconstructor(
     }
 
     fun reset() {
+        // Mask hysteresis is owned by the preview worker — clear it there.
+        worker.execute { maskStabilizer.reset() }
         // Volume/tracker/mesh are owned by the fusion worker — reset there to avoid racing a fuse.
         fusionWorker.execute {
             volume.reset()
@@ -245,15 +252,22 @@ class LiveReconstructor(
         val focusDepth = centerMedianDepth(arcoreMetric)
 
         // Object mask (FastSAM) aligned to the depth image; gates the scale fit and fusion so only
-        // the segmented object is reconstructed. Null when segmentation is off/nothing at center.
+        // the segmented object is reconstructed. The raw per-frame mask flickers and sometimes grabs
+        // a background anchor, so we run it through temporal hysteresis (slow to add, quick to drop)
+        // and fuse only the *stabilized* mask. Null when segmentation is off / nothing locked.
         val tSam0 = System.nanoTime()
-        val mask = if (argb != null && seg != null) {
-            seg.inferObjectMask(argb, arcoreMetric.width, arcoreMetric.height)
+        val mask = if (seg != null) {
+            val raw = if (argb != null) {
+                seg.inferObjectMask(argb, arcoreMetric.width, arcoreMetric.height)
+            } else {
+                null
+            }
+            maskStabilizer.update(raw, arcoreMetric.width, arcoreMetric.height)
         } else {
             null
         }
         if (debugEnabled) {
-            Log.i(TAG, "PERF sam=${(System.nanoTime() - tSam0) / 1_000_000L}ms maskNull=${mask == null}")
+            Log.i(TAG, "PERF sam=${(System.nanoTime() - tSam0) / 1_000_000L}ms on=${maskStabilizer.lastOnCount}")
         }
 
         if (debugEnabled && argb != null) {
