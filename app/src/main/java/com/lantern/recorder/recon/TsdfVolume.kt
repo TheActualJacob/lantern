@@ -28,6 +28,9 @@ class TsdfVolume(
     private var centered = false
     private val sdfTrunc = voxelSize * sdfTruncMult
 
+    /** Half the grid's world extent; [origin] + this on each axis is the volume center. */
+    val halfExtent: Float get() = resolution * voxelSize * 0.5f
+
     /** Camera-to-OpenCV-camera flip (diag(1,-1,-1,1)) applied to world->camera. */
     private val flip = floatArrayOf(
         1f, 0f, 0f, 0f,

@@ -52,6 +52,9 @@ class LiveReconstructor(
     /** Latest ARCore support-plane world-Y (object's surface); voxels below it are culled. */
     @Volatile private var lastGroundPlaneY: Float? = null
 
+    /** Consecutive keyframes the look-target has been far from the current anchor (re-lock debounce). */
+    private var reanchorStreak = 0
+
     /** Which dense-depth runtime is live (for the UI readout); ARCORE when no model loaded. */
     val depthBackend: DepthBackendKind get() = depth?.kind ?: DepthBackendKind.ARCORE
 
@@ -68,6 +71,7 @@ class LiveReconstructor(
             volume.reset()
             lastKeyframePos = null
             integratedFrames = 0
+            reanchorStreak = 0
             meshRef.set(MeshData.EMPTY)
             versionRef.set(versionRef.get() + 1)
         }
@@ -145,9 +149,26 @@ class LiveReconstructor(
             }
         }
 
-        if (!volume.isCentered) {
-            val centroid = estimateCentroidWorld(fusionDepth, depthIntrinsics, cameraToWorld)
-            if (centroid != null) volume.centerOn(centroid[0], centroid[1], centroid[2])
+        // What the camera is currently pointed at (object center in the world).
+        val centroid = estimateCentroidWorld(fusionDepth, depthIntrinsics, cameraToWorld)
+        if (centroid != null) {
+            if (!volume.isCentered) {
+                volume.centerOn(centroid[0], centroid[1], centroid[2])
+                reanchorStreak = 0
+            } else if (isNewTarget(centroid)) {
+                // Pointed at a different object: re-lock there after a short debounce so a brief
+                // glance away doesn't wipe the scan, then clear the old mesh and rebuild fresh.
+                if (++reanchorStreak >= REANCHOR_FRAMES) {
+                    volume.reset()
+                    volume.centerOn(centroid[0], centroid[1], centroid[2])
+                    meshRef.set(MeshData.EMPTY)
+                    versionRef.set(versionRef.get() + 1)
+                    integratedFrames = 0
+                    reanchorStreak = 0
+                }
+            } else {
+                reanchorStreak = 0
+            }
         }
         if (!volume.isCentered) return
 
@@ -159,6 +180,15 @@ class LiveReconstructor(
             meshRef.set(mesh)
             versionRef.set(versionRef.get() + 1)
         }
+    }
+
+    /** True if [centroid] is far enough from the current volume center to be a different object. */
+    private fun isNewTarget(centroid: FloatArray): Boolean {
+        val half = volume.halfExtent
+        val dx = centroid[0] - (volume.origin[0] + half)
+        val dy = centroid[1] - (volume.origin[1] + half)
+        val dz = centroid[2] - (volume.origin[2] + half)
+        return dx * dx + dy * dy + dz * dz > REANCHOR_DIST_M * REANCHOR_DIST_M
     }
 
     /** Median center-window depth back-projected along the camera's forward ray. */
@@ -210,5 +240,10 @@ class LiveReconstructor(
     companion object {
         private const val KEYFRAME_TRANSLATION_M = 0.02f // 2 cm between fused keyframes
         private const val EXTRACT_EVERY = 5 // re-mesh every N integrations (marching cubes is heavy)
+
+        // Re-lock onto a new object when the look-target sits more than this from the current
+        // anchor for REANCHOR_FRAMES keyframes (debounced so orbiting one object doesn't reset).
+        private const val REANCHOR_DIST_M = 0.22f
+        private const val REANCHOR_FRAMES = 3
     }
 }
