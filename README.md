@@ -11,7 +11,8 @@ Faithful reconstruction (not generative): **TSDF fusion of ARCore-aligned monocu
 ```
 RGB + ARCore pose + raw depth + intrinsics
    │
-   ├─► Depth-Anything-V2 Small ........ dense RELATIVE depth (affine-invariant)
+   ├─► Depth-Anything-3 Small ......... dense RELATIVE depth (affine-invariant)
+   │     (DA-V2 Small = fallback)        NPU-optimized for SM8750 (~43 ms/frame)
    ├─► affine scale/shift solver ...... fit metric ≈ s·pred + t  vs ARCore sparse
    │                                     metric depth → real meters (solve s AND t)
    ├─► TSDF fusion (Open3D) ........... average many views → one clean surface
@@ -19,7 +20,15 @@ RGB + ARCore pose + raw depth + intrinsics
    └─► import_and_clean.py (Blender) .. watertight + normals + m→mm → CAD-ready .glb
 ```
 
-Two depth sources by design: **DA-V2** gives a dense, smooth depth in unknown units; **ARCore** gives sparse-but-metric depth. The affine solver marries them so the mesh is both dense *and* correctly sized. See [`roadmap.md`](roadmap.md) for the full execution plan, decision log, and risk register.
+Two depth sources by design: the **monocular depth net** gives a dense, smooth depth in unknown units; **ARCore** gives sparse-but-metric depth. The affine solver marries them so the mesh is both dense *and* correctly sized. See [`roadmap.md`](roadmap.md) for the full execution plan, decision log, and risk register.
+
+**Depth net: Depth-Anything-3 Small** (Apache-2.0, 24.7 M params, 518×518) is the host default and the on-device target — Qualcomm AI Hub already exports it NPU-optimized for the S25 SoC (`SM8750`) at ~43 ms/frame float on the Hexagon NPU. DA-V2 Small stays as the documented fallback. Generate disparities with `depth_anything_v3.py`; build the ExecuTorch `.pte` with `export_da3_executorch.py` (`pip install -r requirements-da3.txt` first). See [`LIVE_MESH_PLAN.md`](LIVE_MESH_PLAN.md) §5.0a for the research log.
+
+```bash
+pip install -r requirements-da3.txt
+python3 depth_anything_v3.py --frames <dataset>/frames --output <dataset>/disparities
+python3 export_da3_executorch.py --backend qnn --soc SM8750 -o da3_small_sm8750.pte
+```
 
 ## Target device
 
@@ -32,13 +41,19 @@ Two depth sources by design: **DA-V2** gives a dense, smooth depth in unknown un
 | File | What |
 |---|---|
 | `roadmap.md` | Full execution roadmap — DAG, 6 phases, 5 decisions, risk register, module cards |
+| `depth_anything_v3.py` | DA3-Small host inference → pipeline disparities (drop-in for `depth_model.py`) |
+| `export_da3_executorch.py` | DA3-Small → ExecuTorch `.pte` (XNNPACK CPU / QNN `SM8750` NPU) |
+| `depth_model.py` | DA-V2 Small host inference (fallback depth net) |
+| `requirements-da3.txt` | Heavy DA3/torch/ExecuTorch extras (kept out of core `requirements.txt`) |
 | `import_and_clean.py` | Host-side mesh cleanup: raw TSDF mesh → watertight, scaled, CAD-ready `.glb` |
 | `test_harness.sh` | Offline smoke test (generates a sphere fixture, runs the script, validates) |
 | `orientation_test.sh` | Distinct-dims box test — verifies the pipeline is orientation-preserving |
 
 ## Mesh cleanup — `import_and_clean.py`
 
-Takes the reconstruction's output mesh (`.glb`, also `.obj/.ply/.stl`) and produces a clean, CAD-ready `.glb`: import → join parts → voxel-remesh to watertight → consistent normals → scale m→mm → export. Returns a non-zero exit on failure so the pipeline can gate on it.
+Takes the reconstruction's output mesh (`.glb`, also `.obj/.ply/.stl`) and produces a clean mesh: import → join parts → voxel-remesh to watertight → consistent normals → scale m→mm → export. Writes **both** a `.glb` (for viewers/web) **and an `.stl`** beside it — CAD tools (Fusion 360, FreeCAD) can't read `.glb`, so the `.stl` is the actual CAD handoff. Returns a non-zero exit on failure so the pipeline can gate on it.
+
+Verify CAD-importability with `cad_check.py` (imports the STL through the OpenCASCADE kernel — FreeCAD's kernel — and reports *imports-as-mesh-body* and *solid-convertible*; needs `cadquery-ocp`).
 
 ```bash
 blender --background --python import_and_clean.py -- input.glb output.glb

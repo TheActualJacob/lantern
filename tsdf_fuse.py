@@ -12,6 +12,8 @@ import trimesh
 DEPTH_SCALE = 1000.0
 DEPTH_TRUNC = 5.0
 INTRINSIC_KEYS = {"fx", "fy", "cx", "cy", "width", "height"}
+ARCORE_TO_OPEN3D_CAMERA = np.diag([1.0, -1.0, -1.0, 1.0])
+POSE_CONVENTIONS = {"arcore", "opencv"}
 
 
 def load_poses(arcore_dir: str) -> list[np.ndarray]:
@@ -43,8 +45,11 @@ def fuse(
     poses: list[np.ndarray],
     intrinsics: dict,
     voxel_size: float = 0.01,
+    sdf_trunc_mult: float = 5.0,
+    depth_trunc: float = DEPTH_TRUNC,
+    pose_convention: str = "arcore",
     output_path: str = "output/mesh.glb",
-) -> None:
+) -> dict[str, object]:
     """Fuse 16-bit millimeter depth frames into a TSDF and export a GLB mesh.
 
     Args:
@@ -52,9 +57,22 @@ def fuse(
         poses: Camera-to-world 4x4 pose matrices, one per depth frame.
         intrinsics: Dict with fx, fy, cx, cy, width, and height.
         voxel_size: TSDF voxel length in meters.
+        sdf_trunc_mult: TSDF truncation multiplier relative to voxel_size.
+        depth_trunc: Maximum depth integrated, in meters.
+        pose_convention: ``arcore`` for OpenGL-style ARCore camera poses
+            (+Y up, -Z forward), or ``opencv`` for Open3D/OpenCV poses
+            (+Y down, +Z forward).
         output_path: Destination GLB path.
     """
-    _validate_inputs(depth_paths, poses, intrinsics, voxel_size)
+    _validate_inputs(
+        depth_paths,
+        poses,
+        intrinsics,
+        voxel_size,
+        sdf_trunc_mult,
+        depth_trunc,
+        pose_convention,
+    )
 
     camera_intrinsic = o3d.camera.PinholeCameraIntrinsic(
         int(intrinsics["width"]),
@@ -66,7 +84,7 @@ def fuse(
     )
     volume = o3d.pipelines.integration.ScalableTSDFVolume(
         voxel_length=float(voxel_size),
-        sdf_trunc=float(voxel_size) * 5.0,
+        sdf_trunc=float(voxel_size) * float(sdf_trunc_mult),
         color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
     )
 
@@ -75,30 +93,33 @@ def fuse(
         if not depth_path.exists():
             raise FileNotFoundError(f"Depth image does not exist: {depth_path}")
 
-        color_path = _color_path_for_depth(depth_path)
-        if not color_path.exists():
-            raise FileNotFoundError(
-                f"Color image does not exist for depth image {depth_path}: {color_path}"
-            )
-
-        color = o3d.io.read_image(str(color_path))
         depth = o3d.io.read_image(str(depth_path))
+        color_path = _color_path_for_depth(depth_path)
+        if color_path.exists():
+            color = o3d.io.read_image(str(color_path))
+        else:
+            # No RGB available (e.g. C's ARCore sessions are depth+pose only).
+            # Geometry comes entirely from depth; color is cosmetic for TSDF.
+            d = np.asarray(depth)
+            color = o3d.geometry.Image(
+                np.full((d.shape[0], d.shape[1], 3), 160, dtype=np.uint8)
+            )
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             color,
             depth,
             depth_scale=DEPTH_SCALE,
-            depth_trunc=DEPTH_TRUNC,
+            depth_trunc=float(depth_trunc),
             convert_rgb_to_intensity=False,
         )
 
-        # Poses are camera-to-world; Open3D integration expects world-to-camera.
-        world_to_camera = np.linalg.inv(np.asarray(pose, dtype=np.float64))
+        world_to_camera = _world_to_camera(pose, pose_convention)
         volume.integrate(rgbd, camera_intrinsic, world_to_camera)
 
     mesh = volume.extract_triangle_mesh()
     mesh.compute_vertex_normals()
     _keep_largest_triangle_cluster(mesh)
     _export_glb(mesh, output_path)
+    return mesh_stats(mesh)
 
 
 def _validate_inputs(
@@ -106,6 +127,9 @@ def _validate_inputs(
     poses: list[np.ndarray],
     intrinsics: dict,
     voxel_size: float,
+    sdf_trunc_mult: float,
+    depth_trunc: float,
+    pose_convention: str,
 ) -> None:
     if not depth_paths:
         raise ValueError("depth_paths must contain at least one depth image path")
@@ -116,6 +140,15 @@ def _validate_inputs(
         )
     if voxel_size <= 0:
         raise ValueError(f"voxel_size must be positive, got {voxel_size}")
+    if sdf_trunc_mult <= 0:
+        raise ValueError(f"sdf_trunc_mult must be positive, got {sdf_trunc_mult}")
+    if depth_trunc <= 0:
+        raise ValueError(f"depth_trunc must be positive, got {depth_trunc}")
+    if pose_convention not in POSE_CONVENTIONS:
+        raise ValueError(
+            f"pose_convention must be one of {sorted(POSE_CONVENTIONS)}, "
+            f"got {pose_convention!r}"
+        )
 
     missing_keys = sorted(INTRINSIC_KEYS - set(intrinsics))
     if missing_keys:
@@ -138,6 +171,17 @@ def _validate_inputs(
             raise ValueError(f"poses[{idx}] must have shape (4, 4), got {pose_array.shape}")
         if not np.all(np.isfinite(pose_array)):
             raise ValueError(f"poses[{idx}] contains non-finite values")
+
+
+def _world_to_camera(pose: np.ndarray, pose_convention: str) -> np.ndarray:
+    """Convert a camera-to-world pose to Open3D's world-to-camera extrinsic."""
+    camera_to_world = np.asarray(pose, dtype=np.float64)
+    world_to_camera = np.linalg.inv(camera_to_world)
+    if pose_convention == "arcore":
+        # ARCore poses use an OpenGL camera frame: +X right, +Y up, -Z forward.
+        # Open3D RGB-D integration expects +X right, +Y down, +Z forward.
+        return ARCORE_TO_OPEN3D_CAMERA @ world_to_camera
+    return world_to_camera
 
 
 def _color_path_for_depth(depth_path: Path) -> Path:
@@ -182,6 +226,42 @@ def _export_glb(mesh: o3d.geometry.TriangleMesh, output_path: str) -> None:
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     trimesh_mesh.export(output)
+
+
+def mesh_stats(mesh: o3d.geometry.TriangleMesh) -> dict[str, object]:
+    """Return lightweight mesh stats for host-side diagnostics."""
+    vertices = np.asarray(mesh.vertices)
+    faces = np.asarray(mesh.triangles)
+    stats: dict[str, object] = {
+        "vertices": int(len(vertices)),
+        "faces": int(len(faces)),
+        "has_vertex_colors": bool(len(np.asarray(mesh.vertex_colors)) == len(vertices)),
+    }
+    if len(vertices):
+        stats["bounds_min"] = vertices.min(axis=0).tolist()
+        stats["bounds_max"] = vertices.max(axis=0).tolist()
+    else:
+        stats["bounds_min"] = None
+        stats["bounds_max"] = None
+
+    if len(faces):
+        trimesh_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        try:
+            edge_counts = np.bincount(trimesh_mesh.edges_unique_inverse)
+            stats["boundary_edges"] = int(np.count_nonzero(edge_counts == 1))
+            stats["nonmanifold_edges"] = int(np.count_nonzero(edge_counts > 2))
+        except Exception:
+            stats["boundary_edges"] = None
+            stats["nonmanifold_edges"] = None
+        try:
+            stats["components"] = int(len(trimesh_mesh.split(only_watertight=False)))
+        except Exception:
+            stats["components"] = None
+    else:
+        stats["components"] = 0
+        stats["boundary_edges"] = 0
+        stats["nonmanifold_edges"] = 0
+    return stats
 
 
 if __name__ == "__main__":

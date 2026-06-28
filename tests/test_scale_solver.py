@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from scale_solver import solve_affine, solve_affine_ransac
+from scale_solver import solve_affine, solve_affine_ransac, solve_affine_sequence
 
 
 def depth_mm_from_affine(pred_disp: np.ndarray, scale: float, shift: float) -> np.ndarray:
@@ -66,3 +66,25 @@ def test_solve_affine_ransac_recovers_with_outliers() -> None:
 
     assert recovered_s == pytest.approx(true_s, rel=0.02)
     assert recovered_t == pytest.approx(true_t, abs=0.03)
+
+
+def test_solve_affine_sequence_uses_global_scale_and_frame_shifts() -> None:
+    pred_frames = []
+    depth_frames = []
+    masks = []
+    true_s = 2.25
+    true_shifts = np.array([0.2, 0.25, 0.3], dtype=np.float64)
+
+    for idx, shift in enumerate(true_shifts):
+        pred = np.linspace(0.3, 2.0, 100, dtype=np.float32).reshape(10, 10)
+        pred = pred + np.float32(idx * 0.05)
+        depth_frames.append(depth_mm_from_affine(pred, true_s, float(shift)))
+        pred_frames.append(pred)
+        masks.append(np.ones_like(pred, dtype=bool))
+
+    recovered_s, recovered_shifts = solve_affine_sequence(
+        pred_frames, depth_frames, masks, smooth_lambda=0.0
+    )
+
+    assert recovered_s == pytest.approx(true_s, rel=1e-5)
+    np.testing.assert_allclose(recovered_shifts, true_shifts, rtol=1e-5, atol=1e-5)

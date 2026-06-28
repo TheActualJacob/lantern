@@ -1,0 +1,25 @@
+# Depth Anything 3 (DA3) extras — host inference + ExecuTorch export.
+#
+# Heavy, GPU-friendly deps kept OUT of the core requirements.txt so the lantern host
+# pipeline (numpy/opencv/open3d) stays light. Install only when running DA3:
+#
+#   pip install -r requirements.txt        # core pipeline
+#   pip install -r requirements-da3.txt    # + DA3 depth (depth_anything_v3.py / export_da3_executorch.py)
+#
+# Used by:
+#   depth_anything_v3.py      DA3-Small host inference -> pipeline disparities
+#   export_da3_executorch.py  DA3-Small -> ExecuTorch .pte (XNNPACK CPU / QNN SM8750)
+
+# Pin torch to whatever your platform/CUDA needs; DA3-Small is small (24.7M params).
+torch>=2.5
+torchvision>=0.20
+
+# DA3-Small is Apache-2.0 (depth-anything/DA3-SMALL on Hugging Face).
+depth-anything-3>=0.1.1
+huggingface-hub>=0.25
+
+# ExecuTorch host tooling for the .pte export (export_da3_executorch.py).
+# --backend xnnpack works with this alone; --backend qnn additionally requires an
+# ExecuTorch build with the Qualcomm backend + the Qualcomm AI Engine Direct (QNN) SDK:
+#   https://docs.pytorch.org/executorch/stable/backends-qualcomm.html
+executorch>=1.0

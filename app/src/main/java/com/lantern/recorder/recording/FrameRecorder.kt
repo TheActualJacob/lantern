@@ -7,6 +7,8 @@ import android.util.Log
 import com.google.ar.core.Frame
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.NotYetAvailableException
+import com.lantern.recorder.scanning.ObjectAngleCoverage
+import kotlin.math.abs
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -40,8 +42,37 @@ class FrameRecorder(private val context: Context) {
     @Volatile
     var onFrameSaved: ((index: Int, sessionName: String) -> Unit)? = null
 
+    /** Invoked while recording with a short, human-readable status (why we are / aren't saving). */
+    @Volatile
+    var onStatus: ((message: String) -> Unit)? = null
+
+    /**
+     * Turntable mode only: invoked (on the GL thread) at detection rate with the
+     * latest object pose — valid or not — so the UI can show live board-tracking
+     * status and advance the object-angle coverage ring as the object spins, not
+     * just on committed keyframes.
+     */
+    @Volatile
+    var onObjectPose: ((ObjectPose) -> Unit)? = null
+
+    /**
+     * Supplies the per-keyframe object pose `T_CO` (turntable mode) or declines
+     * to (orbit mode). Defaults to [OrbitPoseProvider], i.e. today's behaviour:
+     * no object pose, host fuses in the world frame. Set before [start] to switch
+     * capture mode; the chosen mode + board spec are written to `capture.json`.
+     */
+    @Volatile
+    var poseProvider: PoseProvider = OrbitPoseProvider()
+
     private val ioExecutor = Executors.newSingleThreadExecutor()
     private val savedCount = AtomicInteger(0)
+
+    // Logs the real camera intrinsics exactly once per session (first saved frame).
+    private val loggedIntrinsics = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    // Throttle status spam from the per-frame GL loop.
+    private var lastStatus = ""
+    private var lastStatusMs = 0L
 
     @Volatile
     private var recording = false
@@ -55,8 +86,16 @@ class FrameRecorder(private val context: Context) {
     private var lastSavedZ = 0f
     private var hasLastSaved = false
 
+    // Turntable gating: object rotation (3x3, row-major 9) of the last saved
+    // keyframe, plus a detect-rate throttle so we don't run solvePnP every GL frame.
+    private var lastSavedObjRot: FloatArray? = null
+    private var hasLastSavedObj = false
+    private var lastDetectMs = 0L
+
     val isRecording: Boolean get() = recording
     val sessionName: String? get() = sessionDir?.name
+    val savedFrameCount: Int get() = savedCount.get()
+    val sessionPath: String? get() = sessionDir?.absolutePath
 
     fun start(): String {
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
@@ -65,9 +104,36 @@ class FrameRecorder(private val context: Context) {
         sessionDir = dir
         savedCount.set(0)
         hasLastSaved = false
+        hasLastSavedObj = false
+        lastSavedObjRot = null
+        lastDetectMs = 0L
+        loggedIntrinsics.set(false)
         recording = true
-        Log.i(TAG, "Recording started → ${dir.absolutePath}")
+        writeCaptureSidecar(dir, poseProvider)
+        Log.i(TAG, "Recording started → ${dir.absolutePath} (mode=${poseProvider.captureMode})")
         return dir.name
+    }
+
+    /**
+     * Writes the per-session `capture.json` describing the capture mode (orbit vs
+     * turntable) and, for turntable, the board spec. The host reads this to pick
+     * the fusion frame; a missing/orbit sidecar means today's world-frame path
+     * (plan §4.1, backward compatible).
+     */
+    private fun writeCaptureSidecar(dir: File, provider: PoseProvider) {
+        try {
+            val json = JSONObject().apply {
+                put("capture_mode", provider.captureMode)
+                provider.boardSpec?.let {
+                    put("object_frame", "charuco")
+                    put("board", it.toJson())
+                    put("axis_hint", "board_z")
+                }
+            }
+            File(dir, "capture.json").writeText(json.toString(2))
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to write capture.json", e)
+        }
     }
 
     fun stop() {
@@ -84,14 +150,40 @@ class FrameRecorder(private val context: Context) {
     private fun sessionsRoot(): File =
         File(context.getExternalFilesDir(null), "sessions").apply { mkdirs() }
 
+    /** Logs + surfaces a status message, throttled so the GL loop can't spam it. */
+    private fun reportStatus(message: String) {
+        val now = System.currentTimeMillis()
+        if (message == lastStatus && now - lastStatusMs < 1000L) return
+        lastStatus = message
+        lastStatusMs = now
+        Log.d(TAG, message)
+        onStatus?.invoke(message)
+    }
+
     /**
-     * Called every render frame on the GL thread. Saves the frame if the camera has
-     * moved past the translation threshold and all required images are available.
+     * Called every render frame on the GL thread. Dispatches to the orbit
+     * (camera-translation gated) or turntable (object-rotation gated) path based on
+     * the active [poseProvider].
      */
     fun onFrame(frame: Frame) {
         if (!recording) return
+        if (poseProvider.captureMode == "turntable") {
+            onFrameTurntable(frame)
+        } else {
+            onFrameOrbit(frame)
+        }
+    }
+
+    /**
+     * Orbit mode: the object is fixed and the phone orbits it. Saves a keyframe
+     * whenever the camera has translated past [TRANSLATION_THRESHOLD_M].
+     */
+    private fun onFrameOrbit(frame: Frame) {
         val camera = frame.camera
-        if (camera.trackingState != TrackingState.TRACKING) return
+        if (camera.trackingState != TrackingState.TRACKING) {
+            reportStatus("Move the phone slowly — waiting for tracking (${camera.trackingState})")
+            return
+        }
 
         val pose = camera.pose
         val x = pose.tx()
@@ -110,13 +202,16 @@ class FrameRecorder(private val context: Context) {
         val index = savedCount.get() + 1
 
         val captured = try {
-            capture(frame, index)
+            capture(frame, index, precomputedObjectPose = null)
         } catch (e: NotYetAvailableException) {
             // Camera image or depth not ready yet this frame — retry next frame
-            // without advancing the counter or the last-saved position.
+            // without advancing the counter or the last-saved position. Raw depth
+            // needs translational motion, so this is common until the phone moves.
+            reportStatus("Keep moving — waiting for raw depth…")
             return
         } catch (e: Exception) {
             Log.e(TAG, "Capture failed for frame $index", e)
+            reportStatus("Capture error: ${e.message}")
             return
         }
 
@@ -130,8 +225,89 @@ class FrameRecorder(private val context: Context) {
         ioExecutor.execute { writeFrame(dir, captured) }
     }
 
-    /** Acquires and copies all per-frame data on the GL thread. Buffers are released via `use`. */
-    private fun capture(frame: Frame, index: Int): CapturedFrame {
+    /**
+     * Turntable mode (plan §3): the phone is near-fixed and the object is spun on a
+     * fiducial board, so camera translation never advances — we gate on **object
+     * rotation** instead. At a throttled detect rate we estimate `T_CO`; we surface
+     * it to the UI (live board status + coverage ring) and commit a keyframe each
+     * time the object has rotated past [TURNTABLE_YAW_THRESHOLD_DEG] about the board
+     * axis.
+     */
+    private fun onFrameTurntable(frame: Frame) {
+        val camera = frame.camera
+        if (camera.trackingState != TrackingState.TRACKING) {
+            reportStatus("Hold the phone steady — waiting for tracking (${camera.trackingState})")
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        if (now - lastDetectMs < DETECT_INTERVAL_MS) return
+        lastDetectMs = now
+
+        val objectPose = try {
+            poseProvider.objectPose(frame)
+        } catch (e: Exception) {
+            Log.w(TAG, "Object pose estimation failed", e)
+            ObjectPose.INVALID
+        }
+        // Drive live UI (board lock + coverage) on every detection, valid or not.
+        onObjectPose?.invoke(objectPose)
+
+        if (!objectPose.valid) {
+            reportStatus("Point the camera at the board — object not tracked")
+            return
+        }
+
+        // Object-rotation gate: only commit once the turntable has advanced enough
+        // about the board Z axis since the last saved keyframe.
+        val curRot = ObjectAngleCoverage.rotationOf(objectPose.tCO)
+        val lastRot = lastSavedObjRot
+        if (hasLastSavedObj && lastRot != null) {
+            val relative = ObjectAngleCoverage.multiply3x3(
+                ObjectAngleCoverage.transpose3x3(lastRot), curRot,
+            )
+            val deltaYaw = signedYawDeg(ObjectAngleCoverage.yawAboutZDeg(relative))
+            if (abs(deltaYaw) < TURNTABLE_YAW_THRESHOLD_DEG) {
+                reportStatus("Keep rotating the object…")
+                return
+            }
+        }
+
+        val dir = sessionDir ?: return
+        val index = savedCount.get() + 1
+
+        val captured = try {
+            capture(frame, index, precomputedObjectPose = objectPose)
+        } catch (e: NotYetAvailableException) {
+            reportStatus("Hold steady — waiting for raw depth…")
+            return
+        } catch (e: Exception) {
+            Log.e(TAG, "Capture failed for frame $index", e)
+            reportStatus("Capture error: ${e.message}")
+            return
+        }
+
+        savedCount.incrementAndGet()
+        lastSavedObjRot = curRot
+        hasLastSavedObj = true
+
+        ioExecutor.execute { writeFrame(dir, captured) }
+    }
+
+    /** Wraps a yaw (deg) into (-180, 180] so the gate sees a small signed delta. */
+    private fun signedYawDeg(deg: Float): Float {
+        var d = deg % 360f
+        if (d > 180f) d -= 360f
+        if (d <= -180f) d += 360f
+        return d
+    }
+
+    /**
+     * Acquires and copies all per-frame data on the GL thread. Buffers are released
+     * via `use`. [precomputedObjectPose] lets the turntable path reuse the pose it
+     * already estimated for gating; pass null to estimate here (orbit mode → INVALID).
+     */
+    private fun capture(frame: Frame, index: Int, precomputedObjectPose: ObjectPose?): CapturedFrame {
         val rgb = frame.acquireCameraImage().use { extractYuv(it) }
         val depth = frame.acquireRawDepthImage16Bits().use { extractGray16BigEndian(it) }
         val confidence = frame.acquireRawDepthConfidenceImage().use { extractGray8(it) }
@@ -140,6 +316,16 @@ class FrameRecorder(private val context: Context) {
         val poseMatrix = FloatArray(16)
         camera.pose.toMatrix(poseMatrix, 0)
         val intrinsics = camera.imageIntrinsics
+
+        // Turntable object pose (camera <- object). Orbit mode returns INVALID and
+        // adds no cost. Runs only for committed keyframes, on the GL thread, as the
+        // plan budgets (§5: keyed to keyframes, not every GL frame).
+        val objectPose = precomputedObjectPose ?: try {
+            poseProvider.objectPose(frame)
+        } catch (e: Exception) {
+            Log.w(TAG, "Object pose estimation failed for frame $index", e)
+            ObjectPose.INVALID
+        }
 
         return CapturedFrame(
             index = index,
@@ -153,6 +339,7 @@ class FrameRecorder(private val context: Context) {
             focalLength = intrinsics.focalLength,
             principalPoint = intrinsics.principalPoint,
             intrinsicsDimensions = intrinsics.imageDimensions,
+            objectPose = objectPose,
         )
     }
 
@@ -160,6 +347,20 @@ class FrameRecorder(private val context: Context) {
     private fun writeFrame(dir: File, f: CapturedFrame) {
         val id = "%04d".format(f.index)
         try {
+            // One-time sanity log: the real on-device camera intrinsics + image sizes.
+            // Lets you eyeball the actual S25 focal length in logcat before pulling the
+            // session, instead of guessing fx in the host pipeline. ARCore reports these
+            // for the full CPU image (intrinsics width/height) — the host converter
+            // rescales them to the saved depth resolution.
+            if (loggedIntrinsics.compareAndSet(false, true)) {
+                Log.i(
+                    TAG,
+                    "Intrinsics (full CPU image): fx=${f.focalLength[0]} fy=${f.focalLength[1]} " +
+                        "cx=${f.principalPoint[0]} cy=${f.principalPoint[1]} " +
+                        "size=${f.intrinsicsDimensions[0]}x${f.intrinsicsDimensions[1]} | " +
+                        "saved rgb=${f.rgb.width}x${f.rgb.height} depth=${f.depth.width}x${f.depth.height}",
+                )
+            }
             // RGB → 8-bit PNG via Bitmap.
             val bitmap = Bitmap.createBitmap(f.rgb.argb, f.rgb.width, f.rgb.height, Bitmap.Config.ARGB_8888)
             FileOutputStream(File(dir, "frame_$id.png")).use { out ->
@@ -180,6 +381,7 @@ class FrameRecorder(private val context: Context) {
             // Metadata JSON.
             writeJson(File(dir, "frame_$id.json"), f)
 
+            Log.i(TAG, "Saved frame $id (${f.rgb.width}x${f.rgb.height} rgb, ${f.depth.width}x${f.depth.height} depth)")
             onFrameSaved?.invoke(f.index, dir.name)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to write frame ${f.index}", e)
@@ -209,6 +411,16 @@ class FrameRecorder(private val context: Context) {
                 put("width", f.intrinsicsDimensions[0])
                 put("height", f.intrinsicsDimensions[1])
             })
+            // Turntable object pose T_CO (camera <- object), row-major 4x4, OpenCV
+            // solvePnP convention. Absent/false ⇒ host uses world-frame fusion.
+            put("object_pose_valid", f.objectPose.valid)
+            if (f.objectPose.valid) {
+                put("object_pose_T_CO", f.objectPose.toJsonRows())
+                put("object_pose_corners", f.objectPose.cornerCount)
+                if (!f.objectPose.reprojPx.isNaN()) {
+                    put("object_pose_reproj_px", f.objectPose.reprojPx.toDouble())
+                }
+            }
         }
         file.writeText(json.toString(2))
     }
@@ -322,10 +534,17 @@ class FrameRecorder(private val context: Context) {
         val focalLength: FloatArray,
         val principalPoint: FloatArray,
         val intrinsicsDimensions: IntArray,
+        val objectPose: ObjectPose,
     )
 
     companion object {
         private const val TAG = "LANTERN"
         private const val TRANSLATION_THRESHOLD_M = 0.03f
+
+        /** Turntable: commit a keyframe each time the object rotates this many degrees. */
+        private const val TURNTABLE_YAW_THRESHOLD_DEG = 5f
+
+        /** Turntable: minimum gap between board detections (ms) to bound solvePnP cost. */
+        private const val DETECT_INTERVAL_MS = 66L
     }
 }

@@ -25,6 +25,15 @@
             android:name="com.google.ar.core"
             android:value="required" />
 
+        <!-- The QNN HTP backend's Hexagon stub (libQnnHtpV79Stub.so) dlopens the vendor cDSP
+             fastRPC library libcdsprpc.so. Since Android 12 a vendor library outside the public
+             list must be declared here or the app's linker namespace can't find it (skel load
+             fails with err 4000 -> device INVALID_CONFIG). Optional so non-Qualcomm devices still
+             install and fall back to ExecuTorch/ARCore. -->
+        <uses-native-library
+            android:name="libcdsprpc.so"
+            android:required="false" />
+
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
@@ -35,6 +44,25 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Sessions browser: list / share / delete recorded captures. -->
+        <activity
+            android:name=".sessions.SessionsActivity"
+            android:exported="false"
+            android:label="@string/sessions_title"
+            android:parentActivityName=".MainActivity"
+            android:theme="@style/Theme.Lantern" />
+
+        <!-- Shares zipped sessions without exposing app-private file paths. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
 </manifest>

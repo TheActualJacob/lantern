@@ -2,9 +2,135 @@
     <string name="app_name">Lantern Recorder</string>
     <string name="status_initializing">Initializing AR session…</string>
     <string name="depth_supported">RAW_DEPTH_ONLY supported: %1$s</string>
+    <string name="status_depth_ready">Depth ready · tap to record</string>
+    <string name="status_depth_unsupported">Raw depth unsupported on this device</string>
     <string name="camera_permission_needed">Camera permission is required for AR capture.</string>
     <string name="record_start">● Record</string>
     <string name="record_stop">■ Stop</string>
-    <string name="recording_status">REC ● %1$s — %2$d frames</string>
+    <string name="a11y_start_recording">Start recording</string>
+    <string name="a11y_stop_recording">Stop recording</string>
+    <string name="recording_status">Recording · %2$d frames</string>
+    <string name="recording_saved">Saved %1$d frames → %2$s</string>
     <string name="depth_unsupported_no_record">Raw depth unsupported — recording disabled.</string>
+    <string name="save_confirm_title">%1$d frames saved</string>
+    <string name="save_confirm_view">View</string>
+
+    <!-- Scanning UX: coaching, coverage guide, and correctness guardrails. -->
+    <string name="coach_title">How to scan an object</string>
+    <string name="coach_subtitle">A few habits make the 3D scan clean.</string>
+    <string name="coach_rule_surface_title">Place it on a flat surface</string>
+    <string name="coach_rule_surface_desc">Don\'t hold or rotate the object — moving objects break the scan.</string>
+    <string name="coach_rule_orbit_title">Move the phone slowly around it</string>
+    <string name="coach_rule_orbit_desc">Steady, gentle motion captures clean depth.</string>
+    <string name="coach_rule_no_spin_title">Orbit around it — don\'t spin in place</string>
+    <string name="coach_rule_no_spin_desc">Turning without moving gives no depth to work with.</string>
+    <string name="coach_rule_distance_title">Keep it centered, about 20–60 cm away</string>
+    <string name="coach_rule_distance_desc">Let the object fill the frame, not too close.</string>
+    <string name="coach_rule_sides_title">Cover all sides — top, sides, and angles</string>
+    <string name="coach_rule_sides_desc">Unseen faces become holes in the model.</string>
+    <string name="coach_rule_light_title">Use good, even lighting; avoid glare</string>
+    <string name="coach_rule_light_desc">Bright, soft light reads best.</string>
+    <string name="coach_rule_hands_title">Keep hands out of frame</string>
+    <string name="coach_rule_hands_desc">Fingers in view may end up in the scan — table placement keeps them out.</string>
+    <string name="coach_rule_bottom_title">The resting face won\'t be scanned</string>
+    <string name="coach_rule_bottom_desc">Put the least-important side down — the bottom is filled in automatically during cleanup.</string>
+    <string name="coach_dismiss">Got it</string>
+    <string name="coach_help_cd">Scanning tips</string>
+
+    <!-- Prominent guardrail surfaced over the live feed. -->
+    <string name="guardrail_surface">Place the object on a surface — don\'t hold or rotate it</string>
+
+    <!-- Persistent low-key hint line and motion warning during capture. -->
+    <string name="hint_move_around">Move slowly around the object</string>
+    <string name="warn_pure_rotation">Move around the object, not just turning</string>
+
+    <!-- Coverage gizmo (pose-based viewing-direction dome). -->
+    <string name="coverage_title">Coverage</string>
+    <string name="coverage_locating">Locating…</string>
+    <string name="coverage_percent">%1$d%%</string>
+    <string name="coverage_cd">Scan coverage %1$d percent. The dome shows the object from above: the center is the top, the outer ring is the sides. Lit patches are angles you\'ve captured; dim patches still need covering.</string>
+    <string name="coverage_hint_top">Capture the top — look down on it</string>
+    <string name="coverage_hint_sides">Cover the remaining sides</string>
+
+    <!-- Two-pass "flip the object" flow (capture the resting face). -->
+    <string name="twopass_label">Two-sided scan</string>
+    <string name="twopass_enable_cd">Enable two-sided scan: capture the bottom by flipping the object</string>
+    <string name="twopass_disable_cd">Disable two-sided scan</string>
+    <string name="flip_pass_indicator">Side %1$d of 2</string>
+    <string name="flip_needed_title">Side 1 captured</string>
+    <string name="flip_needed_body">Flip the object so a new face rests on the surface.</string>
+    <string name="flip_inprogress_title">Flipping detected…</string>
+    <string name="flip_inprogress_body">Set it back down when you\'re ready.</string>
+    <string name="flip_manual_hint">Tap here if it\'s already flipped</string>
+    <string name="flip_manual_cd">I\'ve flipped it — ready to scan side 2</string>
+    <string name="flip_ready_title">New side detected</string>
+    <string name="flip_ready_body">Tap the shutter to scan side 2.</string>
+    <string name="flip_complete_title">Both sides captured</string>
+    <string name="flip_complete_body">The two passes will be merged into one model.</string>
+    <string name="object_moved_warning">Object moved — keep it still on the surface</string>
+    <string name="a11y_start_pass_two">Start scanning side 2</string>
+
+    <!-- Capture mode (orbit vs turntable / Object-Centric Capture). -->
+    <string name="mode_orbit">Orbit</string>
+    <string name="mode_turntable">Turntable</string>
+    <string name="mode_orbit_cd">Orbit mode: keep the object still and move the phone around it</string>
+    <string name="mode_turntable_cd">Turntable mode: keep the phone still and rotate the object on the board</string>
+    <string name="turntable_unavailable">Turntable mode needs OpenCV, which failed to load on this device.</string>
+    <string name="mode_livemesh">Live Mesh</string>
+    <string name="mode_livemesh_cd">Live mesh mode: move the phone around the object and watch a 3D mesh build in real time</string>
+    <!-- %1$d vertices, %2$d fused keyframes, %3$s depth backend (NPU/ARCore). -->
+    <string name="livemesh_stats">%1$d verts · %2$d frames · %3$s</string>
+    <string name="livemesh_backend_qnn">QNN NPU</string>
+    <string name="livemesh_backend_da3">DA3 NPU</string>
+    <string name="livemesh_backend_arcore">ARCore depth</string>
+    <string name="board_locked">Board locked — spin the object</string>
+    <string name="board_searching">Point the camera at the board</string>
+    <string name="turntable_hint">Put the object on the board and rotate it slowly</string>
+
+    <!-- Sessions browser (P6 UX). -->
+    <string name="sessions_title">Sessions</string>
+    <string name="sessions_empty_title">No sessions yet</string>
+    <string name="sessions_empty_subtitle">Recorded captures will show up here.</string>
+    <plurals name="session_frames">
+        <item quantity="one">%1$d frame · %2$s</item>
+        <item quantity="other">%1$d frames · %2$s</item>
+    </plurals>
+    <string name="action_share">Share</string>
+    <string name="action_delete">Delete</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="action_back">Back</string>
+    <string name="preparing_share">Preparing zip…</string>
+    <string name="share_session_via">Share session via</string>
+    <string name="share_failed">Couldn\'t create the share archive.</string>
+    <string name="delete_session_title">Delete session?</string>
+    <string name="delete_session_message">%1$s will be permanently removed from this device.</string>
+    <string name="delete_failed">Couldn\'t delete the session.</string>
+
+    <!-- Session detail + reconstruction (UI ahead of the on-device backend). -->
+    <string name="detail_title">Session</string>
+    <string name="build_model">Build 3D Model</string>
+    <string name="build_model_desc">Fuse the captured frames into a 3D mesh using the depth → metric-scale → TSDF pipeline, then clean it up for export.</string>
+    <string name="view_model">View 3D Model</string>
+    <string name="rebuild_model">Rebuild</string>
+    <string name="recon_running_title">Reconstructing…</string>
+    <string name="recon_done_title">Model ready</string>
+    <string name="recon_disclaimer">Preview only — on-device reconstruction isn\'t wired up yet. This runs a simulated pipeline so the flow can be designed ahead of the backend.</string>
+    <string name="stage_depth">Estimating depth · Depth Anything V2</string>
+    <string name="stage_scale">Calibrating metric scale</string>
+    <string name="stage_tsdf">Fusing depth · TSDF volume</string>
+    <string name="stage_mesh">Extracting mesh · marching cubes</string>
+    <string name="stage_cleanup">Cleanup &amp; export · .glb</string>
+
+    <!-- 3D model viewer. -->
+    <string name="model_viewer_title">3D Model</string>
+    <string name="model_stat_vertices">Vertices</string>
+    <string name="model_stat_faces">Faces</string>
+    <string name="model_stat_dimensions">Dimensions</string>
+    <string name="model_stat_size">Estimated size</string>
+    <string name="model_stat_watertight">Watertight</string>
+    <string name="model_export_glb">Export .glb</string>
+    <string name="model_preview_disclaimer">Wireframe placeholder — the real .glb viewer arrives with the reconstruction backend. Geometry and numbers are illustrative.</string>
+    <string name="export_unavailable">Export unlocks once reconstruction is wired up.</string>
+    <string name="value_yes">Yes</string>
+    <string name="value_no">No (remesh in cleanup)</string>
 </resources>

@@ -50,6 +50,23 @@ def test_color_path_for_depth_handles_depth_suffix(monkeypatch) -> None:
     )
 
 
+def test_world_to_camera_converts_arcore_pose(monkeypatch) -> None:
+    tsdf_fuse = fresh_import("tsdf_fuse", monkeypatch, fake_open3d=True)
+    pose = np.eye(4, dtype=np.float64)
+    pose[0, 3] = 2.0
+
+    opencv_extrinsic = tsdf_fuse._world_to_camera(pose, "opencv")
+    arcore_extrinsic = tsdf_fuse._world_to_camera(pose, "arcore")
+
+    expected_opencv = np.eye(4, dtype=np.float64)
+    expected_opencv[0, 3] = -2.0
+    np.testing.assert_allclose(opencv_extrinsic, expected_opencv)
+
+    expected_arcore = np.diag([1.0, -1.0, -1.0, 1.0])
+    expected_arcore[0, 3] = -2.0
+    np.testing.assert_allclose(arcore_extrinsic, expected_arcore)
+
+
 def test_export_glb_writes_parent_directory(tmp_path, monkeypatch) -> None:
     pytest.importorskip("trimesh")
     tsdf_fuse = fresh_import("tsdf_fuse", monkeypatch, fake_open3d=True)
