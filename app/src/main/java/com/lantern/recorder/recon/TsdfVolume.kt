@@ -53,9 +53,17 @@ class TsdfVolume(
      * @param depth metric depth (meters, 0 = invalid) at [intrinsics] resolution.
      * @param intrinsics pinhole intrinsics matching [depth] resolution.
      * @param cameraToWorld row-major 4x4 ARCore camera-to-world pose.
+     * @param groundY optional world-Y of the support surface; voxels at/below it (plus a small
+     *   margin) are skipped so the object reconstructs without the table/floor it rests on.
      */
-    fun integrate(depth: DepthMap, intrinsics: CameraIntrinsics, cameraToWorld: FloatArray) {
+    fun integrate(
+        depth: DepthMap,
+        intrinsics: CameraIntrinsics,
+        cameraToWorld: FloatArray,
+        groundY: Float? = null,
+    ) {
         if (!centered) return
+        val cullBelowY = groundY?.let { it + GROUND_MARGIN }
         val worldToCamCv = Mat4.multiply(flip, Mat4.invertRigid(cameraToWorld))
         val fx = intrinsics.fx
         val fy = intrinsics.fy
@@ -73,6 +81,8 @@ class TsdfVolume(
             val kBase = k * n * n
             for (j in 0 until n) {
                 val wy0 = origin[1] + (j + 0.5f) * voxelSize
+                // Drop the support surface (and anything below it) so only the object remains.
+                if (cullBelowY != null && wy0 < cullBelowY) continue
                 val jBase = kBase + j * n
                 for (i in 0 until n) {
                     val wx0 = origin[0] + (i + 0.5f) * voxelSize
@@ -119,5 +129,9 @@ class TsdfVolume(
     companion object {
         const val DEFAULT_RESOLUTION = 160
         const val DEFAULT_VOXEL_SIZE = 0.004f // 4 mm, in LIVE_MESH_PLAN's 2-4 mm range
+
+        /** Cull plane is lifted this far above the detected surface to clear plane noise/thickness
+         *  while keeping the object's base (ARCore plane Y is only cm-accurate). */
+        private const val GROUND_MARGIN = 0.01f // 1 cm
     }
 }

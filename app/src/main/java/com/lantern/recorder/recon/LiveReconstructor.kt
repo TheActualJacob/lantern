@@ -49,6 +49,9 @@ class LiveReconstructor(
     @Volatile private var integratedFrames = 0
     @Volatile private var running = false
 
+    /** Latest ARCore support-plane world-Y (object's surface); voxels below it are culled. */
+    @Volatile private var lastGroundPlaneY: Float? = null
+
     /** Which dense-depth runtime is live (for the UI readout); ARCORE when no model loaded. */
     val depthBackend: DepthBackendKind get() = depth?.kind ?: DepthBackendKind.ARCORE
 
@@ -82,7 +85,12 @@ class LiveReconstructor(
      * Per-GL-frame hook. Must run on the GL thread while [frame] is current.
      * @param poseColumnMajor ARCore camera-to-world, column-major (from `pose.toMatrix`).
      */
-    fun onFrame(frame: Frame, intrinsics: CameraIntrinsics, poseColumnMajor: FloatArray) {
+    fun onFrame(
+        frame: Frame,
+        intrinsics: CameraIntrinsics,
+        poseColumnMajor: FloatArray,
+        groundPlaneY: Float? = null,
+    ) {
         if (!running) return
         val cameraToWorld = Mat4.fromColumnMajor(poseColumnMajor)
         val camX = cameraToWorld[3]
@@ -102,6 +110,9 @@ class LiveReconstructor(
         } else {
             null
         }
+
+        // Latch the latest support-plane height for the worker (off-thread integrate uses it).
+        if (groundPlaneY != null) lastGroundPlaneY = groundPlaneY
 
         lastKeyframePos = floatArrayOf(camX, camY, camZ)
         busy.set(true)
@@ -140,7 +151,7 @@ class LiveReconstructor(
         }
         if (!volume.isCentered) return
 
-        volume.integrate(fusionDepth, depthIntrinsics, cameraToWorld)
+        volume.integrate(fusionDepth, depthIntrinsics, cameraToWorld, lastGroundPlaneY)
         integratedFrames++
 
         if (integratedFrames % EXTRACT_EVERY == 0) {

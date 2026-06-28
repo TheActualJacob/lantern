@@ -22,6 +22,7 @@ import com.google.ar.core.ArCoreApk
 import com.google.ar.core.CameraConfig
 import com.google.ar.core.CameraConfigFilter
 import com.google.ar.core.Config
+import com.google.ar.core.Plane
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.CameraNotAvailableException
@@ -336,6 +337,9 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             lastLiveMeshVersion = -1
             liveReconstructor?.reset()
             liveReconstructor?.start()
+            // Surface the active depth backend right away (the per-frame stats only update once
+            // ARCore is TRACKING, so without this the chip shows the ARCore default until then).
+            liveReconstructor?.let { uiState.onLiveMeshStats(0, 0, it.depthBackend) }
         } else {
             liveReconstructor?.stop()
         }
@@ -542,6 +546,10 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         config.focusMode = Config.FocusMode.AUTO
         Log.i(TAG, "Focus mode = ${config.focusMode}")
 
+        // Detect the horizontal surface the object rests on so live-mesh fusion can cull it and
+        // reconstruct the object alone (see updateLiveMesh -> supportPlaneY).
+        config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL
+
         session.configure(config)
 
         runOnUiThread { uiState.onDepthResolved(supported) }
@@ -660,7 +668,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         )
         val pose = FloatArray(16)
         camera.pose.toMatrix(pose, 0)
-        recon.onFrame(frame, intrinsics, pose)
+        recon.onFrame(frame, intrinsics, pose, supportPlaneY(camera.pose.ty()))
 
         val version = recon.meshVersion()
         if (version != lastLiveMeshVersion) {
@@ -680,6 +688,26 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             val backend = recon.depthBackend
             runOnUiThread { uiState.onLiveMeshStats(vertices, frames, backend) }
         }
+    }
+
+    /**
+     * World-Y of the surface the object sits on, for live-mesh ground-plane culling, or null if
+     * ARCore hasn't found one yet. Picks the **highest** tracking horizontal upward-facing plane
+     * below the camera — i.e. the tabletop the object rests on (or the floor) rather than a higher
+     * surface. The reconstructor drops everything at/below this height so only the object meshes.
+     */
+    private fun supportPlaneY(cameraY: Float): Float? {
+        val planes = session?.getAllTrackables(Plane::class.java) ?: return null
+        var best: Float? = null
+        for (plane in planes) {
+            if (plane.trackingState != TrackingState.TRACKING) continue
+            if (plane.type != Plane.Type.HORIZONTAL_UPWARD_FACING) continue
+            if (plane.subsumedBy != null) continue
+            val y = plane.centerPose.ty()
+            if (y > cameraY - 0.03f) continue // ignore surfaces at/above the camera
+            if (best == null || y > best!!) best = y
+        }
+        return best
     }
 
     /**
