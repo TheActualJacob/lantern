@@ -13,6 +13,12 @@ from typing import Any
 import cv2
 import numpy as np
 
+from object_frame import (
+    load_capture_meta,
+    load_object_poses,
+    resolve_fusion_frame,
+    select_fusion_inputs,
+)
 from scale_solver import (
     global_scale,
     smooth_shifts,
@@ -77,6 +83,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depth-trunc", type=float, default=5.0)
     parser.add_argument("--pose-convention", choices=["arcore", "opencv"], default="arcore")
     parser.add_argument("--sequence-smooth-lambda", type=float, default=0.05)
+    parser.add_argument(
+        "--fusion-frame",
+        choices=["auto", "world", "object"],
+        default="auto",
+        help=(
+            "Frame the TSDF fuses in. 'world' = ARCore world (orbit, today's path); "
+            "'object' = the board/object frame for turntable captures; 'auto' picks "
+            "object for turntable sessions (capture.json) and world otherwise."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -586,13 +602,20 @@ def main() -> None:
         else arcore_dir
     )
 
+    # Pick the fusion frame: world (orbit) vs object (turntable). For object-frame
+    # fusion we need the per-frame board poses (T_CO) written next to the depth.
+    capture_meta = load_capture_meta(arcore_dir)
+    fusion_frame = resolve_fusion_frame(args.fusion_frame, capture_meta)
+    object_poses = load_object_poses(arcore_dir) if fusion_frame == "object" else None
+    print(f"Fusion frame: {fusion_frame}")
+
     with tempfile.TemporaryDirectory(prefix="lantern_scaled_depth_") as temp_name:
         temp_dir = Path(temp_name)
         diagnostics: list[dict[str, object]] = []
         if args.use_metric_depth_only:
             validate_counts(frame_paths, frame_paths, depth_paths, poses)
             scaled_depth_paths = write_metric_depth_inputs(frame_paths, depth_paths, temp_dir)
-            fusion_poses = poses
+            accepted_indices = list(range(len(frame_paths)))
             print("Using metric depth directly for TSDF baseline.")
         else:
             disp_paths = sorted_paths(disparities_dir, "*.disp.png")
@@ -614,15 +637,32 @@ def main() -> None:
                 max_residual=args.max_residual,
                 sequence_smooth_lambda=args.sequence_smooth_lambda,
             )
-            fusion_poses = [poses[idx] for idx in accepted_indices]
+
+        # Select world vs object poses and the matching axis convention. Object
+        # frames without a valid board pose drop out here, so keep the depth
+        # inputs aligned to the surviving frames.
+        depth_by_index = dict(zip(accepted_indices, scaled_depth_paths, strict=True))
+        fusion_poses, kept_indices, selected_convention = select_fusion_inputs(
+            fusion_frame, poses, object_poses, accepted_indices
+        )
+        fusion_depth_paths = [depth_by_index[idx] for idx in kept_indices]
+        pose_convention = (
+            args.pose_convention if fusion_frame == "world" else selected_convention
+        )
+        if len(kept_indices) != len(accepted_indices):
+            print(
+                f"Object-frame fusion kept {len(kept_indices)}/{len(accepted_indices)} "
+                "frames with a valid board pose."
+            )
+
         mesh_stats = fuse(
-            scaled_depth_paths,
+            fusion_depth_paths,
             fusion_poses,
             intrinsics,
             voxel_size=args.voxel_size,
             sdf_trunc_mult=args.sdf_trunc_mult,
             depth_trunc=args.depth_trunc,
-            pose_convention=args.pose_convention,
+            pose_convention=pose_convention,
             output_path=str(output_path),
         )
         write_diagnostics_json(diagnostics_dir, diagnostics, mesh_stats, args)

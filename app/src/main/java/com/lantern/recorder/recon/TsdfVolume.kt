@@ -1,0 +1,123 @@
+package com.lantern.recorder.recon
+
+/**
+ * Dense truncated signed-distance (TSDF) volume in **world** meters. Fuses many metric
+ * depth frames into one averaged surface, then [extractMesh] runs marching cubes.
+ *
+ * Mirrors the host `tsdf_fuse.py` contract: ARCore camera-to-world poses (OpenGL frame,
+ * +Y up / -Z forward) are flipped into the OpenCV/Open3D camera frame (+Y down / +Z fwd)
+ * before projection, voxel length and `sdf_trunc = voxelSize * sdfTruncMult` match.
+ *
+ * A fixed dense grid (default 160 m-cube of voxels) is fine for a hand-held object roughly
+ * centered in view. Call [centerOn] once with the object centroid before integrating.
+ *
+ * Not thread-safe: integrate + extract from a single worker thread.
+ */
+class TsdfVolume(
+    val resolution: Int = DEFAULT_RESOLUTION,
+    val voxelSize: Float = DEFAULT_VOXEL_SIZE,
+    private val sdfTruncMult: Float = 5f,
+    private val depthTrunc: Float = 5f,
+    private val maxWeight: Float = 64f,
+) {
+    val tsdf = FloatArray(resolution * resolution * resolution) { 1f }
+    val weight = FloatArray(resolution * resolution * resolution)
+
+    /** World coordinate of voxel-center (0,0,0). Set by [centerOn]. */
+    val origin = FloatArray(3)
+    private var centered = false
+    private val sdfTrunc = voxelSize * sdfTruncMult
+
+    /** Camera-to-OpenCV-camera flip (diag(1,-1,-1,1)) applied to world->camera. */
+    private val flip = floatArrayOf(
+        1f, 0f, 0f, 0f,
+        0f, -1f, 0f, 0f,
+        0f, 0f, -1f, 0f,
+        0f, 0f, 0f, 1f,
+    )
+
+    val isCentered: Boolean get() = centered
+
+    /** Center the grid so [worldX,worldY,worldZ] is at the volume's middle. Idempotent-ish. */
+    fun centerOn(worldX: Float, worldY: Float, worldZ: Float) {
+        val half = resolution * voxelSize * 0.5f
+        origin[0] = worldX - half
+        origin[1] = worldY - half
+        origin[2] = worldZ - half
+        centered = true
+    }
+
+    /**
+     * Integrate one metric depth frame.
+     *
+     * @param depth metric depth (meters, 0 = invalid) at [intrinsics] resolution.
+     * @param intrinsics pinhole intrinsics matching [depth] resolution.
+     * @param cameraToWorld row-major 4x4 ARCore camera-to-world pose.
+     */
+    fun integrate(depth: DepthMap, intrinsics: CameraIntrinsics, cameraToWorld: FloatArray) {
+        if (!centered) return
+        val worldToCamCv = Mat4.multiply(flip, Mat4.invertRigid(cameraToWorld))
+        val fx = intrinsics.fx
+        val fy = intrinsics.fy
+        val cx = intrinsics.cx
+        val cy = intrinsics.cy
+        val dw = depth.width
+        val dh = depth.height
+        val d = depth.depthMeters
+        val conf = depth.confidence
+        val p = FloatArray(3)
+        val n = resolution
+
+        for (k in 0 until n) {
+            val wz0 = origin[2] + (k + 0.5f) * voxelSize
+            val kBase = k * n * n
+            for (j in 0 until n) {
+                val wy0 = origin[1] + (j + 0.5f) * voxelSize
+                val jBase = kBase + j * n
+                for (i in 0 until n) {
+                    val wx0 = origin[0] + (i + 0.5f) * voxelSize
+                    Mat4.transformPoint(worldToCamCv, wx0, wy0, wz0, p)
+                    val camZ = p[2]
+                    if (camZ <= 0f || camZ > depthTrunc) continue
+                    val u = (fx * p[0] / camZ + cx)
+                    val v = (fy * p[1] / camZ + cy)
+                    val ui = u.toInt()
+                    val vi = v.toInt()
+                    if (ui < 0 || ui >= dw || vi < 0 || vi >= dh) continue
+                    val pix = vi * dw + ui
+                    val dz = d[pix]
+                    if (dz <= 0f) continue
+                    val sdf = dz - camZ
+                    if (sdf < -sdfTrunc) continue
+                    var tsdfVal = sdf / sdfTrunc
+                    if (tsdfVal > 1f) tsdfVal = 1f
+                    if (tsdfVal < -1f) tsdfVal = -1f
+
+                    val sampleW = if (conf != null) conf[pix].coerceIn(0f, 1f) else 1f
+                    if (sampleW <= 0f) continue
+
+                    val idx = jBase + i
+                    val wOld = weight[idx]
+                    val wNew = wOld + sampleW
+                    if (wNew <= 0f) continue
+                    tsdf[idx] = (tsdf[idx] * wOld + tsdfVal * sampleW) / wNew
+                    weight[idx] = if (wNew > maxWeight) maxWeight else wNew
+                }
+            }
+        }
+    }
+
+    /** Run marching cubes over the integrated region. */
+    fun extractMesh(): MeshData = MarchingCubes.extract(this)
+
+    fun reset() {
+        java.util.Arrays.fill(tsdf, 1f)
+        java.util.Arrays.fill(weight, 0f)
+        centered = false
+    }
+
+    companion object {
+        const val DEFAULT_RESOLUTION = 160
+        const val DEFAULT_VOXEL_SIZE = 0.004f // 4 mm, in LIVE_MESH_PLAN's 2-4 mm range
+    }
+}

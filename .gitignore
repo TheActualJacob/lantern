@@ -73,3 +73,6 @@ pulled_sessions/
 *.mp4
 demo/assets/
 demo/frames/
+
+# Qualcomm DLC model asset (143MB, exceeds GitHub limit)
+depth_anything_v3-qnn_dlc-float/

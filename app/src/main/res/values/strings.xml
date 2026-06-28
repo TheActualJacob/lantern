@@ -9,7 +9,7 @@
     <string name="record_stop">■ Stop</string>
     <string name="a11y_start_recording">Start recording</string>
     <string name="a11y_stop_recording">Stop recording</string>
-    <string name="recording_status">REC ● %1$s — %2$d frames</string>
+    <string name="recording_status">Recording · %2$d frames</string>
     <string name="recording_saved">Saved %1$d frames → %2$s</string>
     <string name="depth_unsupported_no_record">Raw depth unsupported — recording disabled.</string>
     <string name="save_confirm_title">%1$d frames saved</string>
@@ -69,6 +69,22 @@
     <string name="flip_complete_body">The two passes will be merged into one model.</string>
     <string name="object_moved_warning">Object moved — keep it still on the surface</string>
     <string name="a11y_start_pass_two">Start scanning side 2</string>
+
+    <!-- Capture mode (orbit vs turntable / Object-Centric Capture). -->
+    <string name="mode_orbit">Orbit</string>
+    <string name="mode_turntable">Turntable</string>
+    <string name="mode_orbit_cd">Orbit mode: keep the object still and move the phone around it</string>
+    <string name="mode_turntable_cd">Turntable mode: keep the phone still and rotate the object on the board</string>
+    <string name="turntable_unavailable">Turntable mode needs OpenCV, which failed to load on this device.</string>
+    <string name="mode_livemesh">Live Mesh</string>
+    <string name="mode_livemesh_cd">Live mesh mode: move the phone around the object and watch a 3D mesh build in real time</string>
+    <!-- %1$d vertices, %2$d fused keyframes, %3$s depth backend (NPU/ARCore). -->
+    <string name="livemesh_stats">%1$d verts · %2$d frames · %3$s</string>
+    <string name="livemesh_backend_da3">DA3 NPU</string>
+    <string name="livemesh_backend_arcore">ARCore depth</string>
+    <string name="board_locked">Board locked — spin the object</string>
+    <string name="board_searching">Point the camera at the board</string>
+    <string name="turntable_hint">Put the object on the board and rotate it slowly</string>
 
     <!-- Sessions browser (P6 UX). -->
     <string name="sessions_title">Sessions</string>

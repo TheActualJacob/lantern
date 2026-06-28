@@ -30,6 +30,26 @@ sealed interface CaptureStatus {
 data class SavedConfirmation(val session: String, val frames: Int)
 
 /**
+ * How the object is being captured (Object-Centric Capture plan, §3):
+ *  - [Orbit] — today's default: the object is fixed, the phone orbits it; coverage
+ *    tracks **camera azimuth** and keyframes are gated by camera translation.
+ *  - [Turntable] — the phone is near-fixed and the object is spun on a fiducial
+ *    board; coverage tracks **object yaw** (from `T_CO`) and keyframes are gated by
+ *    object rotation. Requires the OpenCV board detector (phase T2).
+ */
+enum class CaptureMode {
+    Orbit,
+    Turntable,
+
+    /**
+     * Board-free **live mesh**: the phone moves around the object and a 3D mesh grows on
+     * screen in real time (ARCore depth + optional on-device DA3 depth -> TSDF -> marching
+     * cubes). See `com.lantern.recorder.recon.LiveReconstructor`.
+     */
+    LiveMesh,
+}
+
+/**
  * The stage of an optional **two-pass "flip the object" scan**, which captures the face
  * the object was resting on by having the user flip it and scan again. Single-pass scans
  * stay in [SinglePass] the whole time.
@@ -79,6 +99,17 @@ class CaptureUiState {
 
     /** Set when a recording finishes; drives the transient save card, then cleared. */
     var savedConfirmation by mutableStateOf<SavedConfirmation?>(null)
+        private set
+
+    /** Selected capture mode (orbit vs turntable). Switchable only while idle. */
+    var captureMode by mutableStateOf(CaptureMode.Orbit)
+        private set
+
+    /**
+     * Turntable mode only: whether the board is currently being tracked (a valid
+     * `T_CO` this detection). Drives the live "Board locked / show the board" hint.
+     */
+    var boardTracking by mutableStateOf(false)
         private set
 
     // ----- Pose-based coverage dome (Deliverable 2) -----
@@ -154,6 +185,27 @@ class CaptureUiState {
     /** True once the current pass has covered enough of the reachable hemisphere. */
     private var passCompleteFired = false
 
+    // ----- Live mesh (board-free real-time reconstruction) -----
+
+    /** Vertices in the currently displayed live mesh. */
+    var liveMeshVertices by mutableIntStateOf(0)
+        private set
+
+    /** Keyframes fused into the live TSDF so far. */
+    var liveMeshFrames by mutableIntStateOf(0)
+        private set
+
+    /** Whether DA3 depth is running on-device (vs ARCore-only depth fallback). */
+    var liveMeshDa3Active by mutableStateOf(false)
+        private set
+
+    /** Updates the live-mesh readout (called on the UI thread from the GL loop). */
+    fun onLiveMeshStats(vertices: Int, frames: Int, da3Active: Boolean) {
+        liveMeshVertices = vertices
+        liveMeshFrames = frames
+        liveMeshDa3Active = da3Active
+    }
+
     fun onDepthResolved(supported: Boolean) {
         depthSupported = supported
         // Don't clobber an active recording / error message with the idle depth state.
@@ -185,6 +237,13 @@ class CaptureUiState {
         objectMovedWarning = false
     }
 
+    /** Switches the capture mode (orbit ⇄ turntable). Idle/pre-record only. */
+    fun selectCaptureMode(mode: CaptureMode) {
+        if (isRecording) return
+        captureMode = mode
+        boardTracking = false
+    }
+
     /** Clears coverage so each recording starts from an empty dome. */
     private fun resetCoverage() {
         bandMaskSides = 0
@@ -195,6 +254,41 @@ class CaptureUiState {
         currentSector = -1
         objectLocked = false
         motionWarning = false
+        boardTracking = false
+    }
+
+    /**
+     * Turntable coverage update (plan §3.4): folds the object-angle ring derived from
+     * `T_CO` (via [com.lantern.recorder.scanning.ObjectAngleCoverage]) into the same
+     * dome UI the orbit path uses. The 12 object-yaw sectors map directly onto the
+     * orbit ring's [AZIMUTH_SECTORS] wedges, so the existing gizmo carries over and a
+     * full object spin can auto-complete a two-pass scan exactly like a full orbit.
+     *
+     * Called on the UI thread from `MainActivity` at board-detection rate; [tracking]
+     * is false when the board isn't currently visible.
+     *
+     * @param sectorMask bitmask of covered object-yaw sectors
+     * @param currentSector the sector the object is in now, or -1
+     * @param coveragePercent covered fraction of the full turntable (0..100)
+     * @param tracking whether the board is locked this detection
+     */
+    fun onObjectCoverage(
+        sectorMask: Int,
+        currentSector: Int,
+        coveragePercent: Int,
+        tracking: Boolean,
+    ) {
+        boardTracking = tracking
+        if (tracking) objectLocked = true
+        if (!tracking) return
+        bandMaskSides = sectorMask
+        bandMaskUpper = 0
+        this.currentSector = currentSector
+        currentBand = 0
+        this.coveragePercent = coveragePercent
+        motionWarning = false
+        // A complete object spin ends the pass just like a complete orbit.
+        maybeCompletePass()
     }
 
     /**

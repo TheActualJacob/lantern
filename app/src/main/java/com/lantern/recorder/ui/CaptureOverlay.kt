@@ -64,6 +64,7 @@ import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -86,56 +87,26 @@ fun CaptureOverlay(
     state: CaptureUiState,
     onToggleRecord: () -> Unit,
     onToggleTwoPass: (Boolean) -> Unit,
+    onSetCaptureMode: (CaptureMode) -> Unit,
+    turntableAvailable: Boolean,
     onOpenSessions: () -> Unit,
     onOpenHelp: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Box(modifier = modifier.fillMaxSize()) {
-        StatusChip(
-            status = state.status,
-            modifier = Modifier
-                .align(Alignment.TopCenter)
-                .windowInsetsPadding(WindowInsets.statusBars)
-                .padding(top = 16.dp, start = 24.dp, end = 24.dp),
-        )
-
-        // Top-start: a two-sided-scan toggle before recording, or the live pass indicator
-        // once a two-pass flip scan is underway.
-        TopStartControls(
+        // One structured top panel: a toolbar row (mode toggle · help), an options row
+        // (two-sided scan), the status chip, and a single mode-aware context line. Each
+        // is its own full-width row in a column, so nothing floats or overlaps.
+        TopPanel(
             state = state,
+            turntableAvailable = turntableAvailable,
+            onSetCaptureMode = onSetCaptureMode,
             onToggleTwoPass = onToggleTwoPass,
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .windowInsetsPadding(WindowInsets.statusBars)
-                .padding(top = 14.dp, start = 16.dp),
-        )
-
-        // Help affordance to re-open the scanning coach overlay (top-end corner).
-        IconButton(
-            onClick = onOpenHelp,
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .windowInsetsPadding(WindowInsets.statusBars)
-                .padding(top = 8.dp, end = 8.dp)
-                .size(48.dp)
-                .clip(CircleShape)
-                .drawBehind { drawCircle(Color.Black.copy(alpha = 0.35f)) },
-        ) {
-            Icon(
-                painter = painterResource(R.drawable.ic_help),
-                contentDescription = stringResource(R.string.coach_help_cd),
-                tint = Color.White,
-            )
-        }
-
-        // Persistent, low-key guidance: the "place on a surface" guardrail when idle,
-        // a "move around" hint as recording starts, and a pure-rotation warning.
-        GuidanceBanner(
-            state = state,
+            onOpenHelp = onOpenHelp,
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .windowInsetsPadding(WindowInsets.statusBars)
-                .padding(top = 72.dp, start = 24.dp, end = 24.dp),
+                .padding(top = 10.dp, start = 16.dp, end = 12.dp),
         )
 
         // Prominent, can't-miss flip-flow card (only during the two-pass flip sequence).
@@ -179,6 +150,19 @@ fun CaptureOverlay(
                 .windowInsetsPadding(WindowInsets.navigationBars)
                 .padding(end = 24.dp, bottom = 44.dp),
         )
+
+        // Live-mesh readout (board-free real-time reconstruction), bottom-end.
+        if (state.captureMode == CaptureMode.LiveMesh) {
+            LiveMeshStatsChip(
+                vertices = state.liveMeshVertices,
+                frames = state.liveMeshFrames,
+                da3Active = state.liveMeshDa3Active,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .windowInsetsPadding(WindowInsets.navigationBars)
+                    .padding(end = 24.dp, bottom = 44.dp),
+            )
+        }
 
         // The shutter is blocked mid-flip (object being handled); in ReadyForPassTwo it
         // invites the user to start the second side.
@@ -498,85 +482,6 @@ private fun statusPresentation(status: CaptureStatus): Triple<String, Color, Boo
 }
 
 /**
- * A single line of contextual guidance shown just under the status chip. It is a
- * correctness aid, not decoration — in priority order it surfaces:
- *  1. an "object moved" warning (the object was bumped mid-pass — breaks fusion),
- *  2. a pure-rotation warning (recording but the recorder isn't getting parallax),
- *  3. a "move around the object" hint while a fresh recording warms up,
- *  4. the "place it on a surface, don't hold/rotate" guardrail while idle.
- * Hidden during the flip flow (the prominent flip card speaks instead).
- */
-@Composable
-private fun GuidanceBanner(
-    state: CaptureUiState,
-    modifier: Modifier = Modifier,
-) {
-    data class Guidance(val text: String, val iconRes: Int, val warning: Boolean)
-
-    val inFlipFlow = state.scanPhase == ScanPhase.NeedsFlip ||
-        state.scanPhase == ScanPhase.Flipping ||
-        state.scanPhase == ScanPhase.ReadyForPassTwo ||
-        state.scanPhase == ScanPhase.Complete
-
-    val guidance: Guidance? = when {
-        inFlipFlow -> null
-
-        state.objectMovedWarning ->
-            Guidance(stringResource(R.string.object_moved_warning), R.drawable.ic_surface, true)
-
-        state.motionWarning ->
-            Guidance(stringResource(R.string.warn_pure_rotation), R.drawable.ic_no_spin, true)
-
-        state.isRecording && state.frameCount == 0 ->
-            Guidance(stringResource(R.string.hint_move_around), R.drawable.ic_orbit, false)
-
-        !state.isRecording && state.depthSupported ->
-            Guidance(stringResource(R.string.guardrail_surface), R.drawable.ic_surface, false)
-
-        else -> null
-    }
-
-    AnimatedVisibility(
-        visible = guidance != null,
-        enter = fadeIn(tween(220)) + slideInVertically(tween(220)) { -it / 3 },
-        exit = fadeOut(tween(160)) + slideOutVertically(tween(160)) { -it / 3 },
-        modifier = modifier,
-    ) {
-        val shown = remember(guidance) { guidance } ?: return@AnimatedVisibility
-        val accent = if (shown.warning) Color(0xFFFFC074) else Color.White
-        Surface(
-            color = if (shown.warning) Color(0xCC5A3A12) else Color.Black.copy(alpha = 0.5f),
-            contentColor = Color.White,
-            shape = RoundedCornerShape(50),
-            modifier = Modifier.semantics {
-                liveRegion = LiveRegionMode.Polite
-                contentDescription = shown.text
-            },
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
-            ) {
-                Icon(
-                    painter = painterResource(shown.iconRes),
-                    contentDescription = null,
-                    tint = accent,
-                    modifier = Modifier.size(18.dp),
-                )
-                Text(
-                    text = shown.text,
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.Medium,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.clearAndSetSemantics {},
-                )
-            }
-        }
-    }
-}
-
-/**
  * The pose-based coverage guide (Deliverable 2, v2 = **dome / azimuth + elevation**).
  * A small top-down polar map of the viewing hemisphere over the object: the filled
  * center is the top cap (looking straight down), the middle ring is the upper band, and
@@ -694,100 +599,387 @@ private fun CoverageGizmo(
 }
 
 /**
- * Top-start cluster for the two-pass flip flow: a "Two-sided scan" toggle while idle
- * (so the user can opt in before recording), which becomes a live "Side N of 2" pass
- * indicator once a two-pass scan is underway.
+ * The single, structured top panel. Laid out strictly top-to-bottom as full-width
+ * rows so elements never float or overlap:
+ *
+ *   1. **Toolbar** — capture-mode toggle (or live pass indicator) on the left, help
+ *      on the right.
+ *   2. **Options** — the two-sided-scan toggle (idle only).
+ *   3. **Status** — the capture status chip.
+ *   4. **Context** — exactly one mode-aware guidance line (never the orbit
+ *      "don't rotate" guardrail in turntable mode).
  */
 @Composable
-private fun TopStartControls(
+private fun TopPanel(
     state: CaptureUiState,
+    turntableAvailable: Boolean,
+    onSetCaptureMode: (CaptureMode) -> Unit,
     onToggleTwoPass: (Boolean) -> Unit,
+    onOpenHelp: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val phase = state.scanPhase
-    val inFlow = phase != ScanPhase.SinglePass
-    Box(modifier = modifier) {
-        if (inFlow && state.twoPassEnabled) {
-            // Live pass indicator.
-            val sideNumber = when (phase) {
-                ScanPhase.PassOne, ScanPhase.NeedsFlip -> 1
-                ScanPhase.Flipping, ScanPhase.ReadyForPassTwo, ScanPhase.PassTwo -> 2
-                ScanPhase.Complete -> 2
-                else -> 1
-            }
-            val label = stringResource(R.string.flip_pass_indicator, sideNumber)
-            Surface(
-                color = Color.Black.copy(alpha = 0.5f),
-                contentColor = Color.White,
-                shape = RoundedCornerShape(50),
-                modifier = Modifier.semantics { contentDescription = label },
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(7.dp),
-                    modifier = Modifier.padding(horizontal = 13.dp, vertical = 8.dp),
-                ) {
-                    Icon(
-                        painter = painterResource(R.drawable.ic_flip),
-                        contentDescription = null,
-                        tint = Color(0xFF8FC9FF),
-                        modifier = Modifier.size(16.dp),
-                    )
-                    Text(
-                        text = label,
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.clearAndSetSemantics {},
-                    )
+    val inFlow = state.scanPhase != ScanPhase.SinglePass
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        // 1. Toolbar row.
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Box(contentAlignment = Alignment.CenterStart) {
+                when {
+                    !state.isRecording && state.depthSupported ->
+                        CaptureModeToggle(state.captureMode, turntableAvailable, onSetCaptureMode)
+                    state.isRecording && state.twoPassEnabled && inFlow ->
+                        PassIndicator(state.scanPhase)
+                    else -> {}
                 }
             }
-        } else if (!state.isRecording && state.depthSupported) {
-            // Pre-record opt-in toggle.
-            val on = state.twoPassEnabled
-            val cd = stringResource(
-                if (on) R.string.twopass_disable_cd else R.string.twopass_enable_cd,
+            HelpButton(onOpenHelp)
+        }
+
+        // 2. Options row: two-sided scan toggle (idle, pre-record).
+        if (!state.isRecording && state.depthSupported) {
+            Row(modifier = Modifier.fillMaxWidth()) {
+                TwoPassToggle(on = state.twoPassEnabled, onToggle = onToggleTwoPass)
+            }
+        }
+
+        // 3. Status chip.
+        StatusChip(status = state.status, modifier = Modifier.widthIn(max = 360.dp))
+
+        // 4. One mode-aware context line.
+        ContextLine(state = state)
+    }
+}
+
+/** Round, translucent help button (re-opens the scanning coach). */
+@Composable
+private fun HelpButton(onOpenHelp: () -> Unit) {
+    IconButton(
+        onClick = onOpenHelp,
+        modifier = Modifier
+            .size(44.dp)
+            .clip(CircleShape)
+            .drawBehind { drawCircle(Color.Black.copy(alpha = 0.4f)) },
+    ) {
+        Icon(
+            painter = painterResource(R.drawable.ic_help),
+            contentDescription = stringResource(R.string.coach_help_cd),
+            tint = Color.White,
+        )
+    }
+}
+
+/**
+ * A small segmented Orbit | Turntable selector shown while idle. Orbit keeps the
+ * object still and moves the phone; Turntable keeps the phone still and spins the
+ * object on a fiducial board (Object-Centric Capture, §3).
+ */
+@Composable
+private fun CaptureModeToggle(
+    mode: CaptureMode,
+    turntableAvailable: Boolean,
+    onSetCaptureMode: (CaptureMode) -> Unit,
+) {
+    Surface(
+        color = Color.Black.copy(alpha = 0.42f),
+        shape = RoundedCornerShape(50),
+    ) {
+        Row(
+            modifier = Modifier.padding(3.dp),
+            horizontalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            ModeSegment(
+                label = stringResource(R.string.mode_orbit),
+                cd = stringResource(R.string.mode_orbit_cd),
+                selected = mode == CaptureMode.Orbit,
+                onClick = { onSetCaptureMode(CaptureMode.Orbit) },
             )
-            Surface(
-                color = if (on) Color(0xCC10324F) else Color.Black.copy(alpha = 0.42f),
-                contentColor = Color.White,
-                shape = RoundedCornerShape(50),
-                modifier = Modifier
-                    .clip(RoundedCornerShape(50))
-                    .clickable(
-                        role = Role.Switch,
-                        onClickLabel = cd,
-                        onClick = { onToggleTwoPass(!on) },
-                    )
-                    .semantics { contentDescription = cd },
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(7.dp),
-                    modifier = Modifier.padding(horizontal = 13.dp, vertical = 8.dp),
-                ) {
-                    Icon(
-                        painter = painterResource(R.drawable.ic_flip),
-                        contentDescription = null,
-                        tint = if (on) Color(0xFF8FC9FF) else Color.White.copy(alpha = 0.85f),
-                        modifier = Modifier.size(16.dp),
-                    )
-                    Text(
-                        text = stringResource(R.string.twopass_label),
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.Medium,
-                        modifier = Modifier.clearAndSetSemantics {},
-                    )
-                    // Simple on/off dot.
-                    Box(
-                        Modifier
-                            .size(9.dp)
-                            .clip(CircleShape)
-                            .drawBehind {
-                                drawCircle(if (on) Color(0xFF6BE675) else Color.White.copy(alpha = 0.3f))
-                            },
-                    )
-                }
+            if (turntableAvailable) {
+                ModeSegment(
+                    label = stringResource(R.string.mode_turntable),
+                    cd = stringResource(R.string.mode_turntable_cd),
+                    selected = mode == CaptureMode.Turntable,
+                    onClick = { onSetCaptureMode(CaptureMode.Turntable) },
+                )
             }
+            ModeSegment(
+                label = stringResource(R.string.mode_livemesh),
+                cd = stringResource(R.string.mode_livemesh_cd),
+                selected = mode == CaptureMode.LiveMesh,
+                onClick = { onSetCaptureMode(CaptureMode.LiveMesh) },
+            )
+        }
+    }
+}
+
+/** Live-mesh readout (vertex count, fused keyframes, depth backend) shown in LiveMesh mode. */
+@Composable
+private fun LiveMeshStatsChip(
+    vertices: Int,
+    frames: Int,
+    da3Active: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val backend = stringResource(
+        if (da3Active) R.string.livemesh_backend_da3 else R.string.livemesh_backend_arcore
+    )
+    val label = stringResource(R.string.livemesh_stats, vertices, frames, backend)
+    Surface(
+        color = Color.Black.copy(alpha = 0.5f),
+        contentColor = Color.White,
+        shape = RoundedCornerShape(50),
+        modifier = modifier.semantics {
+            liveRegion = LiveRegionMode.Polite
+            contentDescription = label
+        },
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
+        ) {
+            Box(
+                Modifier
+                    .size(9.dp)
+                    .clip(CircleShape)
+                    .drawBehind { drawCircle(if (da3Active) Color(0xFF6BE675) else Color(0xFF8FC9FF)) },
+            )
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.clearAndSetSemantics {},
+            )
+        }
+    }
+}
+
+@Composable
+private fun ModeSegment(
+    label: String,
+    cd: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    Surface(
+        color = if (selected) Color(0xCC10324F) else Color.Transparent,
+        contentColor = Color.White,
+        shape = RoundedCornerShape(50),
+        modifier = Modifier
+            .clip(RoundedCornerShape(50))
+            .clickable(role = Role.Button, onClickLabel = cd, onClick = onClick)
+            .semantics {
+                this.contentDescription = cd
+                this.selected = selected
+            },
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+            color = if (selected) Color.White else Color.White.copy(alpha = 0.7f),
+            modifier = Modifier
+                .padding(horizontal = 14.dp, vertical = 7.dp)
+                .clearAndSetSemantics {},
+        )
+    }
+}
+
+/** Turntable board-lock status pill (green = locked, amber = searching). */
+@Composable
+private fun BoardStatusChip(tracking: Boolean) {
+    val accent = if (tracking) Color(0xFF6BE675) else Color(0xFFFFC074)
+    val label = stringResource(if (tracking) R.string.board_locked else R.string.board_searching)
+    Surface(
+        color = Color.Black.copy(alpha = 0.5f),
+        contentColor = Color.White,
+        shape = RoundedCornerShape(50),
+        modifier = Modifier.semantics {
+            liveRegion = LiveRegionMode.Polite
+            contentDescription = label
+        },
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+        ) {
+            Box(
+                Modifier
+                    .size(9.dp)
+                    .clip(CircleShape)
+                    .drawBehind { drawCircle(accent) },
+            )
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.clearAndSetSemantics {},
+            )
+        }
+    }
+}
+
+/** Live "Side N of 2" indicator shown on the toolbar during a two-pass flip scan. */
+@Composable
+private fun PassIndicator(phase: ScanPhase) {
+    val sideNumber = when (phase) {
+        ScanPhase.PassOne, ScanPhase.NeedsFlip -> 1
+        ScanPhase.Flipping, ScanPhase.ReadyForPassTwo, ScanPhase.PassTwo, ScanPhase.Complete -> 2
+        else -> 1
+    }
+    val label = stringResource(R.string.flip_pass_indicator, sideNumber)
+    Surface(
+        color = Color.Black.copy(alpha = 0.5f),
+        contentColor = Color.White,
+        shape = RoundedCornerShape(50),
+        modifier = Modifier.semantics { contentDescription = label },
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
+            modifier = Modifier.padding(horizontal = 13.dp, vertical = 8.dp),
+        ) {
+            Icon(
+                painter = painterResource(R.drawable.ic_flip),
+                contentDescription = null,
+                tint = Color(0xFF8FC9FF),
+                modifier = Modifier.size(16.dp),
+            )
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.clearAndSetSemantics {},
+            )
+        }
+    }
+}
+
+/** Pre-record "Two-sided scan" opt-in toggle. */
+@Composable
+private fun TwoPassToggle(on: Boolean, onToggle: (Boolean) -> Unit) {
+    val cd = stringResource(if (on) R.string.twopass_disable_cd else R.string.twopass_enable_cd)
+    Surface(
+        color = if (on) Color(0xCC10324F) else Color.Black.copy(alpha = 0.42f),
+        contentColor = Color.White,
+        shape = RoundedCornerShape(50),
+        modifier = Modifier
+            .clip(RoundedCornerShape(50))
+            .clickable(role = Role.Switch, onClickLabel = cd, onClick = { onToggle(!on) })
+            .semantics { contentDescription = cd },
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
+            modifier = Modifier.padding(horizontal = 13.dp, vertical = 8.dp),
+        ) {
+            Icon(
+                painter = painterResource(R.drawable.ic_flip),
+                contentDescription = null,
+                tint = if (on) Color(0xFF8FC9FF) else Color.White.copy(alpha = 0.85f),
+                modifier = Modifier.size(16.dp),
+            )
+            Text(
+                text = stringResource(R.string.twopass_label),
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.clearAndSetSemantics {},
+            )
+            Box(
+                Modifier
+                    .size(9.dp)
+                    .clip(CircleShape)
+                    .drawBehind {
+                        drawCircle(if (on) Color(0xFF6BE675) else Color.White.copy(alpha = 0.3f))
+                    },
+            )
+        }
+    }
+}
+
+/**
+ * The single contextual guidance line under the status chip — **mode aware**, so the
+ * orbit "place it down, don't rotate" guardrail never appears in turntable mode (where
+ * rotating the object is the whole point). At most one message shows at a time; the
+ * prominent flip card speaks for itself during the flip flow, so we stay quiet then.
+ */
+@Composable
+private fun ContextLine(state: CaptureUiState) {
+    val inFlipFlow = state.scanPhase == ScanPhase.NeedsFlip ||
+        state.scanPhase == ScanPhase.Flipping ||
+        state.scanPhase == ScanPhase.ReadyForPassTwo ||
+        state.scanPhase == ScanPhase.Complete
+
+    when {
+        inFlipFlow -> {}
+
+        // Turntable: rotating IS the instruction. Show board lock while recording,
+        // and a setup hint while idle — never the orbit guardrail.
+        state.captureMode == CaptureMode.Turntable -> {
+            if (state.isRecording) {
+                BoardStatusChip(tracking = state.boardTracking)
+            } else {
+                InfoChip(stringResource(R.string.turntable_hint), R.drawable.ic_orbit)
+            }
+        }
+
+        // Orbit guidance, in priority order.
+        state.objectMovedWarning ->
+            InfoChip(stringResource(R.string.object_moved_warning), R.drawable.ic_surface, warning = true)
+
+        state.motionWarning ->
+            InfoChip(stringResource(R.string.warn_pure_rotation), R.drawable.ic_no_spin, warning = true)
+
+        state.isRecording && state.frameCount == 0 ->
+            InfoChip(stringResource(R.string.hint_move_around), R.drawable.ic_orbit)
+
+        !state.isRecording && state.depthSupported ->
+            InfoChip(stringResource(R.string.guardrail_surface), R.drawable.ic_surface)
+
+        else -> {}
+    }
+}
+
+/** A compact pill carrying one line of guidance (info = dark, warning = amber). */
+@Composable
+private fun InfoChip(text: String, iconRes: Int, warning: Boolean = false) {
+    val accent = if (warning) Color(0xFFFFC074) else Color.White
+    Surface(
+        color = if (warning) Color(0xCC5A3A12) else Color.Black.copy(alpha = 0.5f),
+        contentColor = Color.White,
+        shape = RoundedCornerShape(50),
+        modifier = Modifier
+            .widthIn(max = 360.dp)
+            .semantics {
+                liveRegion = LiveRegionMode.Polite
+                contentDescription = text
+            },
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
+        ) {
+            Icon(
+                painter = painterResource(iconRes),
+                contentDescription = null,
+                tint = accent,
+                modifier = Modifier.size(18.dp),
+            )
+            Text(
+                text = text,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Medium,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.clearAndSetSemantics {},
+            )
         }
     }
 }

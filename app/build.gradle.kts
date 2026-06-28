@@ -37,6 +37,13 @@ android {
     buildFeatures {
         compose = true
     }
+
+    packaging {
+        jniLibs {
+            // Both OpenCV and ExecuTorch's fbjni ship libc++_shared.so; keep one copy.
+            pickFirsts += "lib/**/libc++_shared.so"
+        }
+    }
 }
 
 dependencies {
@@ -46,6 +53,14 @@ dependencies {
     implementation(libs.androidx.recyclerview)
     // ARCore SDK (camera, pose, raw depth).
     implementation(libs.arcore)
+
+    // OpenCV (Turntable mode only): ChArUco board detection + solvePnP for the
+    // per-frame object pose. Gated behind the capture-mode switch in the UI.
+    implementation(libs.opencv)
+
+    // ExecuTorch on-device runtime: runs the Depth-Anything-3 Small .pte (depth) on
+    // the Snapdragon NPU/CPU for the live-mesh capture mode. See recon/DepthSource.kt.
+    implementation(libs.executorch)
 
     // Jetpack Compose UI overlay + sessions screen. The BOM keeps every Compose
     // artifact on a single, mutually-compatible version set.

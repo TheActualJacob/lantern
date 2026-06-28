@@ -53,6 +53,33 @@ def format_pose_text(rows: list[list[float]]) -> str:
     return "\n".join(" ".join(f"{v:.9e}" for v in row) for row in rows) + "\n"
 
 
+def object_pose_rows(meta: dict) -> list[list[float]] | None:
+    """Extract the turntable object pose ``T_CO`` (camera<-object) as 4x4 rows.
+
+    Returns None when the session is orbit-mode or the board wasn't seen this
+    frame (``object_pose_valid`` false / missing). Accepts either a nested 4x4
+    list or a flat row-major 16-element list under ``object_pose_T_CO``.
+
+    Unlike the camera pose, ``T_CO`` comes from OpenCV ``solvePnP`` and is already
+    a plain row-major matrix, so it is written straight through (no transpose).
+    """
+    if not meta.get("object_pose_valid", False):
+        return None
+    raw = meta.get("object_pose_T_CO")
+    if raw is None:
+        return None
+    if isinstance(raw[0], (list, tuple)):
+        rows = [[float(v) for v in row] for row in raw]
+    else:
+        flat = [float(v) for v in raw]
+        if len(flat) != 16:
+            raise ValueError(f"object_pose_T_CO must have 16 values, got {len(flat)}")
+        rows = [flat[r * 4 : r * 4 + 4] for r in range(4)]
+    if len(rows) != 4 or any(len(row) != 4 for row in rows):
+        raise ValueError("object_pose_T_CO must be a 4x4 matrix")
+    return rows
+
+
 def format_intrinsics_text(intr: dict) -> str:
     # Tokens MUST be `key=value` with no comments: pipeline_float splits on
     # whitespace and rejects any token lacking '='.
@@ -83,9 +110,16 @@ def convert(session_dir: Path, out_dir: Path) -> int:
     frames_dir.mkdir(parents=True, exist_ok=True)
     arcore_dir.mkdir(parents=True, exist_ok=True)
 
+    # Carry the per-session capture sidecar (capture mode + board spec) so the
+    # host can pick the object fusion frame for turntable sessions (plan §4.1).
+    capture_sidecar = session_dir / "capture.json"
+    if capture_sidecar.exists():
+        shutil.copyfile(capture_sidecar, arcore_dir / "capture.json")
+
     intrinsics_written = False
     written = 0
     skipped = 0
+    object_poses_written = 0
 
     for out_idx, meta_path in enumerate(metas):
         idx = frame_index(meta_path)
@@ -114,6 +148,14 @@ def convert(session_dir: Path, out_dir: Path) -> int:
         _sanity_check_translation(rows, meta, base)
         (arcore_dir / f"{base}.pose.txt").write_text(format_pose_text(rows), encoding="utf-8")
 
+        # Turntable object pose (camera<-object), when the board was seen.
+        obj_rows = object_pose_rows(meta)
+        if obj_rows is not None:
+            (arcore_dir / f"{base}.object_pose.txt").write_text(
+                format_pose_text(obj_rows), encoding="utf-8"
+            )
+            object_poses_written += 1
+
         # Intrinsics: one file for the whole session (color-image intrinsics).
         if not intrinsics_written:
             (arcore_dir / "intrinsics.txt").write_text(
@@ -123,14 +165,24 @@ def convert(session_dir: Path, out_dir: Path) -> int:
 
         written += 1
 
-    print(f"Converted {written} frame(s)" + (f", skipped {skipped}" if skipped else ""))
+    print(
+        f"Converted {written} frame(s)"
+        + (f", skipped {skipped}" if skipped else "")
+        + (f", {object_poses_written} object pose(s)" if object_poses_written else "")
+    )
     print(f"  frames -> {frames_dir}")
     print(f"  arcore -> {arcore_dir}")
+    disparities_dir = out_dir / "disparities"
     print()
-    print("Run the float pipeline (after the AI/disparity step produces disparities/):")
+    print("1) Generate disparities (Depth-Anything-3 Small; needs requirements-da3.txt):")
+    print(
+        f"  python3 depth_anything_v3.py --frames {frames_dir} "
+        f"--output {disparities_dir}"
+    )
+    print("2) Run the float pipeline:")
     print(
         f"  python3 pipeline_float.py --frames {frames_dir} "
-        f"--arcore {arcore_dir} --disparities <disparities_dir> "
+        f"--arcore {arcore_dir} --disparities {disparities_dir} "
         f"--output {out_dir / 'output' / 'mesh.glb'}"
     )
     return written

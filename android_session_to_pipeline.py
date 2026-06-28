@@ -58,6 +58,24 @@ def pose_from_column_major(values: list[float]) -> np.ndarray:
     return pose.reshape((4, 4), order="F")
 
 
+def object_pose_from_meta(metadata: dict) -> np.ndarray | None:
+    """Parse the turntable object pose ``T_CO`` (camera<-object) or None.
+
+    None when orbit-mode / board not seen this frame. ``T_CO`` comes from OpenCV
+    ``solvePnP`` (a plain row-major matrix), accepted as a nested 4x4 or a flat
+    row-major 16-element list.
+    """
+    if not metadata.get("object_pose_valid", False):
+        return None
+    raw = metadata.get("object_pose_T_CO")
+    if raw is None:
+        return None
+    arr = np.asarray(raw, dtype=np.float64)
+    if arr.size != 16:
+        raise ValueError(f"object_pose_T_CO must have 16 values, got {arr.size}")
+    return arr.reshape((4, 4))  # row-major; solvePnP T_CO is not OpenGL column-major
+
+
 def scaled_intrinsics(metadata: dict, target_width: int, target_height: int) -> dict[str, float | int]:
     intrinsics = metadata["intrinsics"]
     source_width = float(intrinsics["width"])
@@ -122,6 +140,12 @@ def convert_session(
     frames_dir.mkdir(parents=True, exist_ok=True)
     arcore_dir.mkdir(parents=True, exist_ok=True)
 
+    # Carry the per-session capture sidecar (capture mode + board spec) through to
+    # the host so it can select the object fusion frame for turntable sessions.
+    capture_sidecar = session_dir / "capture.json"
+    if capture_sidecar.exists():
+        shutil.copy2(capture_sidecar, arcore_dir / "capture.json")
+
     intrinsics_written = False
     converted = 0
     for index, json_path in enumerate(json_paths):
@@ -150,6 +174,10 @@ def convert_session(
             arcore_dir / f"{base}.pose.txt",
             pose_from_column_major(metadata["pose_matrix_column_major"]),
         )
+
+        object_pose = object_pose_from_meta(metadata)
+        if object_pose is not None:
+            np.savetxt(arcore_dir / f"{base}.object_pose.txt", object_pose)
 
         if not intrinsics_written:
             write_intrinsics(arcore_dir / "intrinsics.txt", intrinsics)

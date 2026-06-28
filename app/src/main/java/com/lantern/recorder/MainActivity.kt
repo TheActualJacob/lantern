@@ -3,6 +3,7 @@ package com.lantern.recorder
 import android.content.Intent
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
+import android.opengl.Matrix
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
@@ -22,23 +23,35 @@ import com.google.ar.core.CameraConfig
 import com.google.ar.core.CameraConfigFilter
 import com.google.ar.core.Config
 import com.google.ar.core.Session
+import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.CameraNotAvailableException
 import com.google.ar.core.exceptions.UnavailableApkTooOldException
 import com.google.ar.core.exceptions.UnavailableArcoreNotInstalledException
 import com.google.ar.core.exceptions.UnavailableDeviceNotCompatibleException
 import com.google.ar.core.exceptions.UnavailableSdkTooOldException
 import com.google.ar.core.exceptions.UnavailableUserDeclinedInstallationException
+import com.lantern.recorder.recording.BoardSpec
 import com.lantern.recorder.recording.FrameRecorder
+import com.lantern.recorder.recording.OpenCvBoardDetector
+import com.lantern.recorder.recording.OrbitPoseProvider
+import com.lantern.recorder.recording.PoseProvider
+import com.lantern.recorder.recording.TurntablePoseProvider
+import com.lantern.recorder.recon.CameraIntrinsics
+import com.lantern.recorder.recon.LiveReconstructor
 import com.lantern.recorder.rendering.BackgroundRenderer
 import com.lantern.recorder.rendering.DisplayRotationHelper
+import com.lantern.recorder.rendering.MeshRenderer
 import com.lantern.recorder.scanning.FlipDetector
+import com.lantern.recorder.scanning.ObjectAngleCoverage
 import com.lantern.recorder.sessions.SessionStore
 import com.lantern.recorder.sessions.SessionsActivity
+import com.lantern.recorder.ui.CaptureMode
 import com.lantern.recorder.ui.CaptureOverlay
 import com.lantern.recorder.ui.CaptureUiState
 import com.lantern.recorder.ui.CoachOverlay
 import com.lantern.recorder.ui.ScanPhase
 import com.lantern.recorder.ui.theme.LanternTheme
+import org.opencv.android.OpenCVLoader
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -62,6 +75,16 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     private val backgroundRenderer = BackgroundRenderer()
     private lateinit var frameRecorder: FrameRecorder
+
+    // Board-free live mesh (recon package): ARCore depth + optional on-device DA3 depth
+    // -> TSDF -> marching cubes, drawn over the camera feed in LiveMesh capture mode.
+    private val meshRenderer = MeshRenderer()
+    private var liveReconstructor: LiveReconstructor? = null
+    private val liveViewMatrix = FloatArray(16)
+    private val liveProjMatrix = FloatArray(16)
+    private val liveMvpMatrix = FloatArray(16)
+    private var lastLiveMeshVersion = -1
+    private var lastLiveStatsMs = 0L
 
     /** Compose-observable mirror of capture state, updated on the UI thread. */
     private val uiState = CaptureUiState()
@@ -94,6 +117,14 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private val flipDetector = FlipDetector()
     private var lastFlipTickMs = 0L
     private var scanGroupId: String? = null
+
+    // Turntable mode (Object-Centric Capture, T2/T3). The board frame is the object
+    // frame; the detector recovers T_CO per keyframe and the coverage tracks object
+    // yaw. OpenCV is loaded once at startup; if it fails we fall back to orbit only.
+    private val boardSpec = BoardSpec()
+    private var openCvReady = false
+    private var boardDetector: OpenCvBoardDetector? = null
+    private val objectCoverage = ObjectAngleCoverage()
     // Seed for the second pass's centroid, captured when the object settles after a flip.
     private var passTwoSeedX = 0f
     private var passTwoSeedY = 0f
@@ -114,6 +145,11 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        // Load OpenCV's bundled native lib up front so Turntable mode's ChArUco
+        // detector can be constructed on demand. Orbit mode never touches OpenCV.
+        openCvReady = OpenCVLoader.initLocal()
+        Log.i(TAG, "OpenCV initLocal() = $openCvReady")
+
         displayRotationHelper = DisplayRotationHelper(this)
 
         // The camera feed MUST stay on a GLSurfaceView. We build it programmatically and
@@ -128,6 +164,13 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             setWillNotDraw(false)
         }
 
+        // Live mesh reconstructor. Looks for an on-device DA3 .pte (exported by
+        // export_da3_executorch.py) for dense NPU depth; if it's absent it still builds a
+        // mesh from ARCore raw depth alone. We check the external files dir first since it's
+        // directly `adb push`-able (/sdcard/Android/data/<pkg>/files/), then internal.
+        val da3ModelPath = resolveDa3ModelPath()
+        liveReconstructor = LiveReconstructor(da3ModelPath)
+
         frameRecorder = FrameRecorder(this)
         frameRecorder.onFrameSaved = { index, sessionName ->
             runOnUiThread { uiState.onFrameSaved(sessionName, index) }
@@ -135,6 +178,23 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         frameRecorder.onStatus = { message ->
             // Only surface diagnostics while recording; ignore once frames are flowing.
             if (frameRecorder.isRecording) runOnUiThread { uiState.onMessage(message) }
+        }
+        // Turntable mode: each board detection advances the object-angle coverage ring
+        // (and the live "board locked" hint), independent of keyframe commits.
+        frameRecorder.onObjectPose = { pose ->
+            runOnUiThread {
+                if (pose.valid) {
+                    objectCoverage.onObjectPose(pose.tCO)
+                    uiState.onObjectCoverage(
+                        sectorMask = objectCoverage.sectorMask,
+                        currentSector = objectCoverage.currentSector,
+                        coveragePercent = objectCoverage.coveragePercent,
+                        tracking = true,
+                    )
+                } else {
+                    uiState.onObjectCoverage(0, -1, 0, tracking = false)
+                }
+            }
         }
         // When a two-pass pass auto-completes, cut the recording cleanly before the user
         // handles the object. Fired on the UI thread from the coverage bookkeeping.
@@ -155,6 +215,8 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     state = uiState,
                     onToggleRecord = ::toggleRecording,
                     onToggleTwoPass = { enabled -> uiState.toggleTwoPass(enabled) },
+                    onSetCaptureMode = ::onSelectCaptureMode,
+                    turntableAvailable = openCvReady,
                     onOpenSessions = {
                         startActivity(Intent(this, SessionsActivity::class.java))
                     },
@@ -208,6 +270,10 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             if (uiState.twoPassEnabled && !startingPassTwo) {
                 scanGroupId = "group_" + STAMP.format(Date())
             }
+            // Pick orbit vs turntable capture before starting; turntable plugs in the
+            // OpenCV board detector and resets the object-angle coverage ring.
+            frameRecorder.poseProvider = poseProviderForMode()
+            objectCoverage.reset()
             val name = frameRecorder.start()
             uiState.onRecordingStarted(name)
             lastCoverageCount = 0
@@ -222,6 +288,52 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             }
             hasPassTwoSeed = false
         }
+    }
+
+    /**
+     * Resolves the DA3 `.pte` path, preferring the external files dir (adb-pushable to
+     * `/sdcard/Android/data/com.lantern.recorder/files/da3_small_sm8750.pte`) and falling
+     * back to internal `filesDir`. Returns the external path even if absent so the log
+     * points the user at the right place; the loader degrades to ARCore depth when missing.
+     */
+    private fun resolveDa3ModelPath(): String {
+        val name = "da3_small_sm8750.pte"
+        val external = getExternalFilesDir(null)?.let { File(it, name) }
+        if (external != null && external.exists()) return external.absolutePath
+        val internal = File(filesDir, name)
+        if (internal.exists()) return internal.absolutePath
+        return (external ?: internal).absolutePath
+    }
+
+    /** Switches capture mode from the overlay toggle (idle only; turntable needs OpenCV). */
+    private fun onSelectCaptureMode(mode: CaptureMode) {
+        if (frameRecorder.isRecording) return
+        if (mode == CaptureMode.Turntable && !openCvReady) {
+            showMessage(getString(R.string.turntable_unavailable))
+            return
+        }
+        uiState.selectCaptureMode(mode)
+        // Live mesh runs whenever its mode is selected (independent of the recorder), so
+        // start a fresh reconstruction on entry and pause it when leaving.
+        if (mode == CaptureMode.LiveMesh) {
+            lastLiveMeshVersion = -1
+            liveReconstructor?.reset()
+            liveReconstructor?.start()
+        } else {
+            liveReconstructor?.stop()
+        }
+    }
+
+    /** Builds the [PoseProvider] for the selected capture mode (constructs OpenCV lazily). */
+    private fun poseProviderForMode(): PoseProvider = when (uiState.captureMode) {
+        CaptureMode.Turntable -> {
+            val detector = boardDetector
+                ?: OpenCvBoardDetector(boardSpec).also { boardDetector = it }
+            TurntablePoseProvider(boardSpec, detector)
+        }
+        // Live mesh doesn't use the recorder's pose provider for its reconstruction, but
+        // recording in this mode (if started) should behave like a free orbit.
+        CaptureMode.Orbit, CaptureMode.LiveMesh -> OrbitPoseProvider()
     }
 
     /**
@@ -318,6 +430,8 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             // Abandon any in-progress flip flow rather than resuming mid-flip later.
             uiState.resetScanFlow()
             flipDetector.clear()
+            // Pause live-mesh fusion so the worker doesn't touch a paused session.
+            liveReconstructor?.stop()
             // Order matters: pause rendering before pausing the session.
             displayRotationHelper.onPause()
             surfaceView.onPause()
@@ -327,6 +441,8 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
     override fun onDestroy() {
         frameRecorder.shutdown()
+        liveReconstructor?.close()
+        liveReconstructor = null
         session?.close()
         session = null
         super.onDestroy()
@@ -467,6 +583,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         backgroundRenderer.createOnGlThread()
+        meshRenderer.createOnGlThread()
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -494,9 +611,57 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             // Between passes of a two-pass scan, watch (depth-based) for the object being
             // flipped and set back down. Cheap, throttled, and only while not recording.
             updateFlipWatch(frame)
+            // Board-free live mesh: fuse depth into the TSDF and draw the growing mesh
+            // over the camera feed (only in LiveMesh capture mode).
+            updateLiveMesh(frame)
         } catch (t: Throwable) {
             // Never let an exception escape the GL thread.
             Log.e(TAG, "Exception on the GL thread", t)
+        }
+    }
+
+    /**
+     * Live mesh hook (GL thread). In [CaptureMode.LiveMesh], hands the current ARCore
+     * frame to the [LiveReconstructor] (which acquires depth/RGB here and fuses on a worker
+     * thread), then draws the newest extracted mesh with the ARCore view/projection so it
+     * sits correctly in the world over the camera feed. No-op in other modes.
+     */
+    private fun updateLiveMesh(frame: com.google.ar.core.Frame) {
+        val recon = liveReconstructor ?: return
+        if (uiState.captureMode != CaptureMode.LiveMesh) return
+        val camera = frame.camera
+        if (camera.trackingState != TrackingState.TRACKING) return
+
+        val intr = camera.imageIntrinsics
+        val intrinsics = CameraIntrinsics(
+            fx = intr.focalLength[0],
+            fy = intr.focalLength[1],
+            cx = intr.principalPoint[0],
+            cy = intr.principalPoint[1],
+            width = intr.imageDimensions[0],
+            height = intr.imageDimensions[1],
+        )
+        val pose = FloatArray(16)
+        camera.pose.toMatrix(pose, 0)
+        recon.onFrame(frame, intrinsics, pose)
+
+        val version = recon.meshVersion()
+        if (version != lastLiveMeshVersion) {
+            meshRenderer.updateMesh(recon.latestMesh(), version)
+            lastLiveMeshVersion = version
+        }
+        camera.getViewMatrix(liveViewMatrix, 0)
+        camera.getProjectionMatrix(liveProjMatrix, 0, 0.05f, 10f)
+        Matrix.multiplyMM(liveMvpMatrix, 0, liveProjMatrix, 0, liveViewMatrix, 0)
+        meshRenderer.draw(liveMvpMatrix)
+
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastLiveStatsMs > 250L) {
+            lastLiveStatsMs = now
+            val vertices = recon.latestMesh().vertexCount
+            val frames = recon.frameCount
+            val da3 = recon.da3Active
+            runOnUiThread { uiState.onLiveMeshStats(vertices, frames, da3) }
         }
     }
 
@@ -548,6 +713,9 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
      */
     private fun updateScanGuidance(frame: com.google.ar.core.Frame) {
         if (!frameRecorder.isRecording) return
+        // Turntable mode drives coverage from the object pose (onObjectPose), not the
+        // camera-azimuth dome — the phone is near-fixed, so this path would mislabel it.
+        if (uiState.captureMode == CaptureMode.Turntable) return
         val camera = frame.camera
         if (camera.trackingState != com.google.ar.core.TrackingState.TRACKING) return
 
