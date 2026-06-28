@@ -1,0 +1,10 @@
+Depth Anything V2 Small QNN lowering report
+
+Target SoC: SM8750
+Backend: Qualcomm HTP / QNN
+Output model: depthanything_v2_small_qnn.pte
+
+Result:
+- QNN lowering completed successfully.
+- QNN partitioner found 1 delegated subgraph.
+- This satisfies the target of <=3 contiguous QNN partitions.
