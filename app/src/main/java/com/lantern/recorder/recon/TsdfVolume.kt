@@ -116,6 +116,10 @@ class TsdfVolume(
                     val vi = v.toInt()
                     if (ui < 0 || ui >= dw || vi < 0 || vi >= dh) continue
                     val pix = vi * dw + ui
+                    // The segmentation mask IS the object filter: skip voxels projecting onto a
+                    // background (non-object) pixel so the floor/clutter never fuses, even though
+                    // the geometric culls are disabled when a mask is present.
+                    if (mask != null && pix < mask.size && mask[pix] < 0.5f) continue
                     val dz = d[pix]
                     if (dz <= 0f) continue
                     val sdf = dz - camZ
