@@ -236,27 +236,28 @@ class BatchReconstructor(
         val mv = multiView ?: return MeshData.EMPTY
         @Suppress("NAME_SHADOWING") val seg = seg ?: return MeshData.EMPTY
         val n = mv.numViews
-        val res = mv.res
+        val resW = mv.resW
+        val resH = mv.resH
         progress?.update(0, 1, "Selecting views…")
         val views = selectViews(frames, n)
 
         progress?.update(0, 1, "Multi-view depth…")
         val result = mv.infer(views.map { it.argb }) ?: return MeshData.EMPTY
 
-        // SAM mask per view, sampled into the same res x res letterboxed grid as the depth.
+        // SAM mask per view, sampled into the same resW x resH letterboxed grid as the depth.
         progress?.update(0, 1, "Masking…")
         val masks = ArrayList<FloatArray>(n)
         for (i in 0 until n) {
             val g = result.geom[i]
             val content = seg.inferObjectMask(views[i].argb, g.newW, g.newH) // 1=object over the image
-            masks.add(placeInSquare(content, g, res))
+            masks.add(placeInRect(content, g, resW, resH))
         }
 
         // Back-project every masked, confident pixel of each view with that view's K + extrinsics.
         val seen = HashSet<Long>(1 shl 16)
         val verts = ArrayList<Float>(1 shl 16)
         val vertKeys = ArrayList<Long>(1 shl 16)
-        val plane = res * res
+        val plane = resW * resH
         val xc = FloatArray(3)
         val xw = FloatArray(3)
         outer@ for (i in 0 until n) {
@@ -267,7 +268,7 @@ class BatchReconstructor(
             // background-sized (covers most of the frame), empty, or off-center (e.g. SAM briefly
             // latched the monitor/desk). Such a frame's depth would smear background into the cloud,
             // so we skip fusing it entirely — the other views still carry the object.
-            if (!maskIsObjectLike(mask, result.geom[i], res)) {
+            if (!maskIsObjectLike(mask, result.geom[i], resW)) {
                 Log.i(TAG, "BatchReconstructor(MV): skipping view $i (mask not object-like)")
                 continue
             }
@@ -283,8 +284,8 @@ class BatchReconstructor(
                 val z = result.depth[dBase + idx]
                 if (z <= 0f || !z.isFinite()) continue
                 if (result.conf[dBase + idx] < confThr) continue
-                val u = idx % res
-                val v = idx / res
+                val u = idx % resW
+                val v = idx / resW
                 xc[0] = (u - cx) / fx * z
                 xc[1] = (v - cy) / fy * z
                 xc[2] = z
@@ -327,12 +328,12 @@ class BatchReconstructor(
         return out
     }
 
-    /** Place a [content]-sized (newW x newH) mask into the padded [res] square at the view's offset. */
-    private fun placeInSquare(content: FloatArray?, g: Da3MultiViewModel.ViewGeom, res: Int): FloatArray {
-        val out = FloatArray(res * res)
+    /** Place a [content]-sized (newW x newH) mask into the padded [resW]x[resH] grid at the offset. */
+    private fun placeInRect(content: FloatArray?, g: Da3MultiViewModel.ViewGeom, resW: Int, resH: Int): FloatArray {
+        val out = FloatArray(resW * resH)
         if (content == null) return out
         for (oy in 0 until g.newH) {
-            val dstRow = (g.padY + oy) * res + g.padX
+            val dstRow = (g.padY + oy) * resW + g.padX
             val srcRow = oy * g.newW
             for (ox in 0 until g.newW) out[dstRow + ox] = content[srcRow + ox]
         }
@@ -356,15 +357,15 @@ class BatchReconstructor(
      * Guards against SAM briefly latching the monitor/desk in one frame (the leak that smears the
      * cloud). [geom] gives the content box so coverage is measured against the image, not the padding.
      */
-    private fun maskIsObjectLike(mask: FloatArray, geom: Da3MultiViewModel.ViewGeom, res: Int): Boolean {
+    private fun maskIsObjectLike(mask: FloatArray, geom: Da3MultiViewModel.ViewGeom, resW: Int): Boolean {
         var on = 0
         var sx = 0.0
         var sy = 0.0
         for (idx in mask.indices) {
             if (mask[idx] < 0.5f) continue
             on++
-            sx += idx % res
-            sy += idx / res
+            sx += idx % resW
+            sy += idx / resW
         }
         val area = (geom.newW * geom.newH).coerceAtLeast(1)
         val cov = on.toFloat() / area

@@ -41,7 +41,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Export multi-view DA3-Small to an ExecuTorch .pte.")
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--views", type=int, default=DEFAULT_VIEWS, help="Fixed number of input views N.")
-    p.add_argument("--res", type=int, default=DEFAULT_RES, help="Fixed square input size (mult of 14).")
+    p.add_argument("--res", type=int, default=DEFAULT_RES, help="Square input size (mult of 14); used if --width/--height unset.")
+    p.add_argument("--width", type=int, default=None, help="Input width (mult of 14). DA3-native 16:9 = 504.")
+    p.add_argument("--height", type=int, default=None, help="Input height (mult of 14). DA3-native 16:9 = 280.")
     p.add_argument("-o", "--output", type=Path, default=None)
     return p.parse_args()
 
@@ -77,8 +79,10 @@ def main() -> None:
     patch_rope_for_export()  # make DINOv2 2D-RoPE export-safe (data-dependent symint)
     wrap = build_mv_module(model.model)
 
-    example = (torch.randn(1, args.views, 3, args.res, args.res, dtype=torch.float32),)
-    print(f"Tracing multi-view DA3: N={args.views} res={args.res} ...")
+    width = args.width or args.res
+    height = args.height or args.res
+    example = (torch.randn(1, args.views, 3, height, width, dtype=torch.float32),)
+    print(f"Tracing multi-view DA3: N={args.views} {width}x{height} (WxH) ...")
     t0 = time.time()
     exported = torch.export.export(wrap, example)
     print(f"  torch.export OK ({len(list(exported.graph.nodes))} nodes, {time.time() - t0:.0f}s)")
@@ -90,10 +94,10 @@ def main() -> None:
     edge = to_edge_transform_and_lower(exported, partitioner=[XnnpackPartitioner()])
     program = edge.to_executorch()
 
-    out = args.output or REPO_ROOT / "models" / f"da3_mv_n{args.views}_r{args.res}.pte"
+    out = args.output or REPO_ROOT / "models" / f"da3_mv_n{args.views}_w{width}_h{height}.pte"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(program.buffer)
-    print(f"Wrote {out} ({out.stat().st_size / 1e6:.1f} MB, N={args.views}, res={args.res}, {time.time() - t0:.0f}s total)")
+    print(f"Wrote {out} ({out.stat().st_size / 1e6:.1f} MB, N={args.views}, {width}x{height}, {time.time() - t0:.0f}s total)")
 
 
 def _hf_repo(name: str) -> str:

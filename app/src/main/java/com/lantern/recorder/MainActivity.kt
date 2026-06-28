@@ -388,7 +388,9 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
      * to the mono per-frame path.
      */
     private fun resolveMvModelPath(): String? =
-        resolveModelPath("da3_mv_n8_r504.pte") ?: resolveModelPath("da3_mv_n8_r350.pte")
+        resolveModelPath("da3_mv_n4_w504_h280.pte") // native-aspect, N=4 (no padding, fits S25 memory)
+            ?: resolveModelPath("da3_mv_n8_r504.pte")
+            ?: resolveModelPath("da3_mv_n8_r350.pte")
 
     /**
      * Locates the Qualcomm QNN depth model for the native Hexagon-NPU backend. Prefers a
