@@ -19,6 +19,9 @@ class TsdfVolume(
     private val sdfTruncMult: Float = 5f,
     private val depthTrunc: Float = 5f,
     private val maxWeight: Float = 64f,
+    /** Horizontal radius (m) around the center axis to fuse; voxels outside are ignored so the
+     *  floor/clutter spreading out around the object don't get reconstructed. <=0 disables. */
+    private val objectRadius: Float = DEFAULT_OBJECT_RADIUS,
 ) {
     val tsdf = FloatArray(resolution * resolution * resolution) { 1f }
     val weight = FloatArray(resolution * resolution * resolution)
@@ -67,6 +70,10 @@ class TsdfVolume(
     ) {
         if (!centered) return
         val cullBelowY = groundY?.let { it + GROUND_MARGIN }
+        // Vertical-cylinder cull around the object's center axis (removes surrounding floor).
+        val centerX = origin[0] + halfExtent
+        val centerZ = origin[2] + halfExtent
+        val radius2 = if (objectRadius > 0f) objectRadius * objectRadius else Float.MAX_VALUE
         val worldToCamCv = Mat4.multiply(flip, Mat4.invertRigid(cameraToWorld))
         val fx = intrinsics.fx
         val fy = intrinsics.fy
@@ -81,6 +88,9 @@ class TsdfVolume(
 
         for (k in 0 until n) {
             val wz0 = origin[2] + (k + 0.5f) * voxelSize
+            val dz = wz0 - centerZ
+            val dz2 = dz * dz
+            if (dz2 > radius2) continue // whole z-slice is outside the object cylinder
             val kBase = k * n * n
             for (j in 0 until n) {
                 val wy0 = origin[1] + (j + 0.5f) * voxelSize
@@ -89,6 +99,8 @@ class TsdfVolume(
                 val jBase = kBase + j * n
                 for (i in 0 until n) {
                     val wx0 = origin[0] + (i + 0.5f) * voxelSize
+                    val dx = wx0 - centerX
+                    if (dx * dx + dz2 > radius2) continue // outside the object cylinder
                     Mat4.transformPoint(worldToCamCv, wx0, wy0, wz0, p)
                     val camZ = p[2]
                     if (camZ <= 0f || camZ > depthTrunc) continue
@@ -132,6 +144,9 @@ class TsdfVolume(
     companion object {
         const val DEFAULT_RESOLUTION = 160
         const val DEFAULT_VOXEL_SIZE = 0.004f // 4 mm, in LIVE_MESH_PLAN's 2-4 mm range
+
+        /** Default object cylinder radius: ~the volume half-extent, i.e. a ~32 cm-wide object. */
+        const val DEFAULT_OBJECT_RADIUS = 0.16f
 
         /** Cull plane is lifted this far above the detected surface to clear plane noise/thickness
          *  while keeping the object's base (ARCore plane Y is only cm-accurate). */
