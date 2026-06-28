@@ -61,6 +61,13 @@ class LiveReconstructor(
     /** Consecutive keyframes the look-target has been far from the current anchor (re-lock debounce). */
     private var reanchorStreak = 0
 
+    /**
+     * EMA of the masked object's median depth over *accepted* frames — the object's established
+     * distance. A frame whose mask depth jumps far from this is a transient FastSAM glitch (it
+     * grabbed the floor/background for a moment), and is rejected before it can bake into the TSDF.
+     */
+    @Volatile private var objectDepthEma: Float? = null
+
     @Volatile var debugEnabled = false
     @Volatile private var latestDebugFrame: DebugFrame? = null
     @Volatile private var loggedDims = false
@@ -87,6 +94,7 @@ class LiveReconstructor(
             lastKeyframePos = null
             integratedFrames = 0
             reanchorStreak = 0
+            objectDepthEma = null
             meshRef.set(MeshData.EMPTY)
             versionRef.set(versionRef.get() + 1)
         }
@@ -180,13 +188,26 @@ class LiveReconstructor(
         // ungated and stick in the volume. Only frames with an object mask contribute.
         if (seg != null && mask == null) return
 
-        // Reject bad-mask frames: when FastSAM momentarily grabs the floor/background instead of
-        // the centered object, the masked region sits at a different distance than the object
-        // (focusDepth). Skip those so transient garbage never bakes into the (permanent) TSDF.
-        if (mask != null && focusDepth != null) {
+        // Reject bad-mask frames so transient garbage never bakes into the (permanent) TSDF.
+        // The TSDF never forgets: one floor-grab frame leaves floor in the mesh forever, so a
+        // momentary FastSAM jump to the floor/background must be caught *before* it fuses.
+        if (mask != null) {
             val maskDepth = maskedMedianDepth(arcoreMetric, mask)
-            if (maskDepth != null && kotlin.math.abs(maskDepth - focusDepth) / focusDepth > MASK_DEPTH_TOL) {
-                return
+            if (maskDepth != null) {
+                // (a) In-frame: the masked region disagrees with the centered object this frame.
+                if (focusDepth != null &&
+                    kotlin.math.abs(maskDepth - focusDepth) / focusDepth > MASK_DEPTH_TOL) {
+                    return
+                }
+                // (b) Temporal: the masked depth jumped away from the object's established distance.
+                // This catches a ~1 s floor grab even when the center reference is itself corrupted,
+                // and never updates the running distance on a rejected frame so a glitch can't creep
+                // in. A genuine approach/retreat moves only ~2 cm per keyframe, well within tolerance.
+                val ema = objectDepthEma
+                if (ema != null && kotlin.math.abs(maskDepth - ema) / ema > OBJECT_DEPTH_JUMP_TOL) {
+                    return
+                }
+                objectDepthEma = if (ema == null) maskDepth else ema + OBJECT_DEPTH_EMA_ALPHA * (maskDepth - ema)
             }
         }
 
@@ -218,6 +239,7 @@ class LiveReconstructor(
                     versionRef.set(versionRef.get() + 1)
                     integratedFrames = 0
                     reanchorStreak = 0
+                    objectDepthEma = null
                 }
             } else {
                 reanchorStreak = 0
@@ -368,5 +390,12 @@ class LiveReconstructor(
         // Skip a frame when the masked region's median depth differs from the centered object's by
         // more than this fraction — i.e. the mask grabbed the floor/background, not the object.
         private const val MASK_DEPTH_TOL = 0.25f
+
+        // Temporal glitch gate: reject a frame whose masked depth jumps more than this fraction
+        // from the object's established (EMA) distance. Handheld motion moves the object only ~2 cm
+        // per keyframe, so a real scan stays well under this; a floor grab spikes far past it.
+        private const val OBJECT_DEPTH_JUMP_TOL = 0.30f
+        // EMA smoothing for the established object distance (higher = tracks faster, forgives less).
+        private const val OBJECT_DEPTH_EMA_ALPHA = 0.2f
     }
 }
