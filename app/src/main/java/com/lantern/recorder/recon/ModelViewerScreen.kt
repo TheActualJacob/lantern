@@ -64,6 +64,7 @@ fun ModelViewerScreen(
     stats: ModelStats,
     onBack: () -> Unit,
     onExport: () -> Unit,
+    mesh: MeshData? = null,
 ) {
     Scaffold(
         topBar = {
@@ -86,6 +87,7 @@ fun ModelViewerScreen(
                 .padding(padding),
         ) {
             Wireframe3DSurface(
+                mesh = mesh,
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f),
@@ -106,9 +108,18 @@ fun ModelViewerScreen(
                             style = MaterialTheme.typography.titleMedium,
                         )
                         Spacer(Modifier.height(12.dp))
-                        StatRow(stringResource(R.string.model_stat_vertices), "%,d".format(stats.vertices))
-                        StatRow(stringResource(R.string.model_stat_faces), "%,d".format(stats.faces))
-                        StatRow(stringResource(R.string.model_stat_dimensions), stats.formattedDimensions())
+                        StatRow(
+                            stringResource(R.string.model_stat_vertices),
+                            "%,d".format(mesh?.vertexCount ?: stats.vertices),
+                        )
+                        StatRow(
+                            stringResource(R.string.model_stat_faces),
+                            "%,d".format(mesh?.triangleCount ?: stats.faces),
+                        )
+                        StatRow(
+                            stringResource(R.string.model_stat_dimensions),
+                            mesh?.let { formatMeshDimensions(it) } ?: stats.formattedDimensions(),
+                        )
                         StatRow(stringResource(R.string.model_stat_size), stats.formattedSize())
                         StatRow(
                             label = stringResource(R.string.model_stat_watertight),
@@ -173,12 +184,14 @@ private fun PreviewDisclaimer() {
 }
 
 /**
- * The placeholder 3D surface: a wireframe icosahedron + point cloud that slowly
- * auto-rotates and responds to drag. Pure [Canvas] math — projects rotated 3D points
- * to 2D — so it carries no rendering-engine dependency.
+ * The 3D surface. When a reconstructed [mesh] is supplied it renders that mesh as a
+ * height/depth-shaded point cloud (subsampled for smooth interaction), auto-centered and
+ * normalized to fit. With no mesh it falls back to the placeholder wireframe icosahedron.
+ * Pure [Canvas] math — projects rotated 3D points to 2D — so it carries no rendering-engine
+ * dependency. Slowly auto-rotates and responds to drag.
  */
 @Composable
-private fun Wireframe3DSurface(modifier: Modifier = Modifier) {
+private fun Wireframe3DSurface(modifier: Modifier = Modifier, mesh: MeshData? = null) {
     val infinite = rememberInfiniteTransition(label = "turntable")
     val autoYaw by infinite.animateFloat(
         initialValue = 0f,
@@ -190,6 +203,9 @@ private fun Wireframe3DSurface(modifier: Modifier = Modifier) {
     // User drag offsets (added on top of the auto-rotation).
     var dragYaw by remember { mutableFloatStateOf(0f) }
     var dragPitch by remember { mutableFloatStateOf(0.5f) }
+
+    // Centered + unit-normalized + subsampled point cloud, computed once per mesh.
+    val points: FloatArray? = remember(mesh) { mesh?.let { normalizedPoints(it, MAX_VIEW_POINTS) } }
 
     Box(
         modifier = modifier
@@ -209,28 +225,48 @@ private fun Wireframe3DSurface(modifier: Modifier = Modifier) {
             val yaw = autoYaw + dragYaw
             val pitch = dragPitch
             val center = Offset(size.width / 2f, size.height / 2f)
-            val radius = size.minDimension * 0.30f
+            val radius = size.minDimension * (if (points != null) 0.42f else 0.30f)
             val focal = 3.2f
+            val cy = cos(yaw); val sy = sin(yaw)
+            val cp = cos(pitch); val sp = sin(pitch)
 
-            fun project(v: FloatArray): Pair<Offset, Float> {
+            fun project(x: Float, y: Float, z: Float): Pair<Offset, Float> {
                 // Rotate around Y (yaw) then X (pitch).
-                val cy = cos(yaw); val sy = sin(yaw)
-                val x1 = v[0] * cy + v[2] * sy
-                val z1 = -v[0] * sy + v[2] * cy
-                val cp = cos(pitch); val sp = sin(pitch)
-                val y2 = v[1] * cp - z1 * sp
-                val z2 = v[1] * sp + z1 * cp
+                val x1 = x * cy + z * sy
+                val z1 = -x * sy + z * cy
+                val y2 = y * cp - z1 * sp
+                val z2 = y * sp + z1 * cp
                 val scale = focal / (focal + z2)
-                return Offset(
-                    center.x + x1 * scale * radius,
-                    center.y - y2 * scale * radius,
-                ) to z2
+                return Offset(center.x + x1 * scale * radius, center.y - y2 * scale * radius) to z2
             }
 
-            // Edges (depth-independent line set for a clean wireframe).
+            if (points != null) {
+                // Real reconstructed object: depth-shaded point cloud, colored by height.
+                var i = 0
+                while (i < points.size) {
+                    val px = points[i]; val py = points[i + 1]; val pz = points[i + 2]
+                    val (p, z) = project(px, py, pz)
+                    val depth = ((z + 1.5f) / 3f).coerceIn(0f, 1f)
+                    val h = ((py + 1f) / 2f).coerceIn(0f, 1f)
+                    val col = Color(
+                        red = (0.20f + 0.70f * h),
+                        green = (0.45f + 0.40f * (1f - kotlin.math.abs(h - 0.5f) * 2f)),
+                        blue = (0.55f + 0.40f * (1f - h)),
+                    )
+                    drawCircle(
+                        color = col.copy(alpha = (0.30f + depth * 0.65f).coerceIn(0.25f, 1f)),
+                        radius = 1.6f + depth * 2.4f,
+                        center = p,
+                    )
+                    i += 3
+                }
+                return@Canvas
+            }
+
+            // Placeholder: wireframe icosahedron + glowing point cloud.
             for ((a, b) in ICOSA_EDGES) {
-                val (pa, za) = project(ICOSA_VERTS[a])
-                val (pb, zb) = project(ICOSA_VERTS[b])
+                val (pa, za) = project(ICOSA_VERTS[a][0], ICOSA_VERTS[a][1], ICOSA_VERTS[a][2])
+                val (pb, zb) = project(ICOSA_VERTS[b][0], ICOSA_VERTS[b][1], ICOSA_VERTS[b][2])
                 val depth = ((za + zb) / 2f + 1.6f) / 3.2f
                 drawLine(
                     color = Color(0xFF5FA8E0).copy(alpha = (0.25f + depth * 0.6f).coerceIn(0.2f, 0.95f)),
@@ -240,10 +276,8 @@ private fun Wireframe3DSurface(modifier: Modifier = Modifier) {
                     cap = StrokeCap.Round,
                 )
             }
-
-            // Vertices as glowing points to suggest a scanned point cloud.
             for (v in ICOSA_VERTS) {
-                val (p, z) = project(v)
+                val (p, z) = project(v[0], v[1], v[2])
                 val depth = (z + 1.6f) / 3.2f
                 drawCircle(
                     color = Color(0xFFE53935).copy(alpha = (0.35f + depth * 0.6f).coerceIn(0.3f, 1f)),
@@ -253,6 +287,61 @@ private fun Wireframe3DSurface(modifier: Modifier = Modifier) {
             }
         }
     }
+}
+
+/** Bounding-box dimensions of a mesh formatted in millimeters (e.g. "120 × 85 × 60 mm"). */
+private fun formatMeshDimensions(mesh: MeshData): String {
+    val v = mesh.vertices
+    var minX = Float.MAX_VALUE; var minY = Float.MAX_VALUE; var minZ = Float.MAX_VALUE
+    var maxX = -Float.MAX_VALUE; var maxY = -Float.MAX_VALUE; var maxZ = -Float.MAX_VALUE
+    var i = 0
+    while (i < v.size) {
+        val x = v[i]; val y = v[i + 1]; val z = v[i + 2]
+        if (x < minX) minX = x; if (x > maxX) maxX = x
+        if (y < minY) minY = y; if (y > maxY) maxY = y
+        if (z < minZ) minZ = z; if (z > maxZ) maxZ = z
+        i += 3
+    }
+    val mm = 1000f
+    return "%.0f × %.0f × %.0f mm".format((maxX - minX) * mm, (maxY - minY) * mm, (maxZ - minZ) * mm)
+}
+
+/** Max points drawn in the viewer; the mesh is strided down to this for smooth interaction. */
+private const val MAX_VIEW_POINTS = 6000
+
+/**
+ * Center a mesh's vertices on their bounding-box midpoint and scale by the inverse of the
+ * largest half-extent so the object fits a unit cube, striding down to ~[budget] points so the
+ * Compose canvas stays smooth. Returns a flat xyz array.
+ */
+private fun normalizedPoints(mesh: MeshData, budget: Int): FloatArray? {
+    val v = mesh.vertices
+    val n = mesh.vertexCount
+    if (n == 0) return null
+    var minX = Float.MAX_VALUE; var minY = Float.MAX_VALUE; var minZ = Float.MAX_VALUE
+    var maxX = -Float.MAX_VALUE; var maxY = -Float.MAX_VALUE; var maxZ = -Float.MAX_VALUE
+    var i = 0
+    while (i < v.size) {
+        val x = v[i]; val y = v[i + 1]; val z = v[i + 2]
+        if (x < minX) minX = x; if (x > maxX) maxX = x
+        if (y < minY) minY = y; if (y > maxY) maxY = y
+        if (z < minZ) minZ = z; if (z > maxZ) maxZ = z
+        i += 3
+    }
+    val cx = (minX + maxX) / 2f; val cy = (minY + maxY) / 2f; val cz = (minZ + maxZ) / 2f
+    val half = maxOf(maxX - minX, maxY - minY, maxZ - minZ) / 2f
+    val inv = if (half > 1e-6f) 1f / half else 1f
+    val stride = maxOf(1, n / budget)
+    val out = ArrayList<Float>(minOf(n, budget) * 3)
+    var idx = 0
+    while (idx < n) {
+        val o = idx * 3
+        out.add((v[o] - cx) * inv)
+        out.add((v[o + 1] - cy) * inv)
+        out.add((v[o + 2] - cz) * inv)
+        idx += stride
+    }
+    return out.toFloatArray()
 }
 
 // --- Icosahedron geometry (12 vertices, 30 edges) used for the wireframe placeholder.

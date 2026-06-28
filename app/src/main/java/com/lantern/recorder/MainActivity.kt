@@ -39,6 +39,7 @@ import com.lantern.recorder.recording.PoseProvider
 import com.lantern.recorder.recording.TurntablePoseProvider
 import com.lantern.recorder.recon.CameraIntrinsics
 import com.lantern.recorder.recon.LiveReconstructor
+import com.lantern.recorder.recon.MeshExport
 import com.lantern.recorder.rendering.BackgroundRenderer
 import com.lantern.recorder.rendering.DisplayRotationHelper
 import com.lantern.recorder.rendering.MeshRenderer
@@ -88,6 +89,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private val liveModelMatrix = FloatArray(16)
     private val liveViewModelMatrix = FloatArray(16)
     private var lastLiveMeshVersion = -1
+    private var lastExportedMeshVersion = -1
     private var lastLiveStatsMs = 0L
 
     /** Compose-observable mirror of capture state, updated on the UI thread. */
@@ -358,7 +360,28 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             // ARCore is TRACKING, so without this the chip shows the ARCore default until then).
             liveReconstructor?.let { uiState.onLiveMeshStats(0, 0, it.depthBackend) }
         } else {
+            // Leaving live mesh: persist whatever was reconstructed before pausing fusion.
+            exportLiveMeshIfAny()
             liveReconstructor?.stop()
+        }
+    }
+
+    /**
+     * Saves the current live-mesh reconstruction to a Wavefront OBJ in the external files dir so
+     * it can be pulled off-device (`.../files/models/model_<ts>.obj`). No-op when the mesh is too
+     * small to be a real object, or already exported (guarded by mesh version) — so leaving the
+     * mode or backgrounding the app never silently loses a scan, and never spams duplicates.
+     */
+    private fun exportLiveMeshIfAny() {
+        val recon = liveReconstructor ?: return
+        val version = recon.meshVersion()
+        if (version == lastExportedMeshVersion) return
+        val mesh = recon.latestMesh()
+        if (mesh.vertexCount < MIN_EXPORT_VERTS) return
+        val file = File(File(getExternalFilesDir(null), "models"), "model_${STAMP.format(Date())}.obj")
+        MeshExport.writeObj(mesh, file)?.let {
+            lastExportedMeshVersion = version
+            showMessage("Saved model: ${it.name} (${mesh.vertexCount} verts)")
         }
     }
 
@@ -468,7 +491,9 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             // Abandon any in-progress flip flow rather than resuming mid-flip later.
             uiState.resetScanFlow()
             flipDetector.clear()
-            // Pause live-mesh fusion so the worker doesn't touch a paused session.
+            // Pause live-mesh fusion so the worker doesn't touch a paused session — but persist
+            // the current reconstruction first so backgrounding mid-scan never loses the model.
+            if (uiState.captureMode == CaptureMode.LiveMesh) exportLiveMeshIfAny()
             liveReconstructor?.stop()
             // Order matters: pause rendering before pausing the session.
             displayRotationHelper.onPause()
@@ -959,6 +984,9 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         private const val FLIP_TICK_MS = 120L
         private const val OBJECT_MOVED_M = 0.10f
         private const val MIN_SAMPLES_FOR_MOVE_CHECK = 4
+
+        /** Below this vertex count the live mesh isn't a real object yet — skip the OBJ export. */
+        private const val MIN_EXPORT_VERTS = 200
         private val STAMP = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
     }
 }

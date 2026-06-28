@@ -21,10 +21,13 @@ import androidx.compose.runtime.setValue
 import androidx.core.content.FileProvider
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.lantern.recorder.R
+import com.lantern.recorder.recon.MeshData
+import com.lantern.recorder.recon.MeshExport
 import com.lantern.recorder.recon.ModelStats
 import com.lantern.recorder.recon.ModelViewerScreen
 import com.lantern.recorder.recon.SessionDetailScreen
 import com.lantern.recorder.ui.theme.LanternTheme
+import java.io.File
 
 /**
  * Browser for recorded capture sessions. Hosts a small in-activity navigation stack
@@ -43,6 +46,9 @@ class SessionsActivity : AppCompatActivity() {
 
     private var sessions by mutableStateOf<List<SessionInfo>>(emptyList())
     private var screen by mutableStateOf<Screen>(Screen.List)
+
+    /** The reconstructed mesh shown in the viewer (latest live-mesh OBJ export); null while loading. */
+    private var viewerMesh by mutableStateOf<MeshData?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -83,20 +89,16 @@ class SessionsActivity : AppCompatActivity() {
                             onBack = { screen = Screen.List },
                             onOpenViewer = { stats ->
                                 screen = Screen.Viewer(target.session, stats)
+                                loadLatestMesh()
                             },
                             onShare = { shareSession(target.session) },
                         )
                         is Screen.Viewer -> ModelViewerScreen(
                             session = target.session,
                             stats = target.stats,
+                            mesh = viewerMesh,
                             onBack = { screen = Screen.Detail(target.session) },
-                            onExport = {
-                                Toast.makeText(
-                                    this@SessionsActivity,
-                                    getString(R.string.export_unavailable),
-                                    Toast.LENGTH_SHORT,
-                                ).show()
-                            },
+                            onExport = { shareLatestModel() },
                         )
                     }
                 }
@@ -111,6 +113,33 @@ class SessionsActivity : AppCompatActivity() {
 
     private fun refresh() {
         sessions = SessionStore.listSessions(this)
+    }
+
+    /** Loads the most recent live-mesh OBJ export into [viewerMesh] off the main thread. */
+    private fun loadLatestMesh() {
+        viewerMesh = null
+        Thread {
+            val file = MeshExport.latestModel(getExternalFilesDir(null))
+            val mesh = file?.let { MeshExport.readObj(it) }
+            runOnUiThread { viewerMesh = mesh }
+        }.start()
+    }
+
+    /** Shares the most recent reconstructed OBJ model via the system share sheet. */
+    private fun shareLatestModel() {
+        val file: File? = MeshExport.latestModel(getExternalFilesDir(null))
+        if (file == null || !file.exists()) {
+            Toast.makeText(this, getString(R.string.export_unavailable), Toast.LENGTH_SHORT).show()
+            return
+        }
+        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "application/octet-stream"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            putExtra(Intent.EXTRA_SUBJECT, file.name)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        startActivity(Intent.createChooser(send, getString(R.string.share_session_via)))
     }
 
     private fun shareSession(session: SessionInfo) {
