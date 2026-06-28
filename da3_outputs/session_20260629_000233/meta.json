@@ -1,0 +1,15 @@
+{
+  "source_session": "pulled_sessions/session_20260629_000233",
+  "num_views": 12,
+  "proc_h": 280,
+  "proc_w": 504,
+  "is_metric": false,
+  "conventions": {
+    "depth": "per-view depth in DA3 units, shape (N,h,w); multi-view CONSISTENT (one shared frame)",
+    "extrinsics_world2cam": "(N,3,4) [R|t], OpenCV world->camera: X_cam = R @ X_world + t",
+    "backproject": "X_cam = depth * Kinv @ [u,v,1];  X_world = R^T @ (X_cam - t)",
+    "intrinsics": "(N,3,3) pinhole at process-res (w x h)",
+    "object_masks": "(N,h,w) uint8 1=object, aligned to depth grid",
+    "processed_images": "(N,h,w,3) uint8 RGB exactly as fed to DA3 (letterboxed)"
+  }
+}
