@@ -25,6 +25,15 @@
             android:name="com.google.ar.core"
             android:value="required" />
 
+        <!-- The QNN HTP backend's Hexagon stub (libQnnHtpV79Stub.so) dlopens the vendor cDSP
+             fastRPC library libcdsprpc.so. Since Android 12 a vendor library outside the public
+             list must be declared here or the app's linker namespace can't find it (skel load
+             fails with err 4000 -> device INVALID_CONFIG). Optional so non-Qualcomm devices still
+             install and fall back to ExecuTorch/ARCore. -->
+        <uses-native-library
+            android:name="libcdsprpc.so"
+            android:required="false" />
+
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"

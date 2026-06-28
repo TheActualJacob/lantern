@@ -79,6 +79,11 @@ android {
         jniLibs {
             // Both OpenCV and ExecuTorch's fbjni ship libc++_shared.so; keep one copy.
             pickFirsts += "lib/**/libc++_shared.so"
+            // QNN's Hexagon DSP skel (libQnnHtpV79Skel.so) must be a real file on disk for
+            // fastRPC to load it onto the NPU; with the modern uncompressed-in-APK default it
+            // isn't, and HTP device bring-up fails. Extract native libs so the skel lands in
+            // the app's nativeLibraryDir (which we add to ADSP_LIBRARY_PATH at runtime).
+            if (qnnEnabled) useLegacyPackaging = true
         }
     }
 }

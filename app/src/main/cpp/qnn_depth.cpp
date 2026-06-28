@@ -21,6 +21,7 @@
 #include <jni.h>
 #include <android/log.h>
 #include <dlfcn.h>
+#include <cstdarg>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -64,6 +65,17 @@ Java_com_lantern_recorder_recon_QnnNative_nativeClose(JNIEnv*, jobject, jlong) {
 
 namespace {
 
+// Forwards QNN's internal backend logs to logcat so device/context failures show their real
+// cause (e.g. cDSP open failure, arch mismatch) instead of just a numeric error handle.
+void qnnLogCallback(const char* fmt, QnnLog_Level_t level, uint64_t /*ts*/, va_list args) {
+    char line[1024];
+    vsnprintf(line, sizeof(line), fmt, args);
+    int prio = (level == QNN_LOG_LEVEL_ERROR) ? ANDROID_LOG_ERROR
+             : (level == QNN_LOG_LEVEL_WARN)  ? ANDROID_LOG_WARN
+                                              : ANDROID_LOG_INFO;
+    __android_log_print(prio, "LANTERN_QNN", "[qnn] %s", line);
+}
+
 // Function-pointer getters exported by the QNN backend / system shared libs.
 typedef Qnn_ErrorHandle_t (*QnnInterfaceGetProvidersFn)(const QnnInterface_t***, uint32_t*);
 typedef Qnn_ErrorHandle_t (*QnnSystemInterfaceGetProvidersFn)(const QnnSystemInterface_t***, uint32_t*);
@@ -76,10 +88,15 @@ struct QnnDepthContext {
     QNN_INTERFACE_VER_TYPE qnn{};       // core API function table
     QNN_SYSTEM_INTERFACE_VER_TYPE sys{}; // system API function table
 
+    Qnn_LogHandle_t logger = nullptr;
     Qnn_BackendHandle_t backend = nullptr;
     Qnn_DeviceHandle_t device = nullptr;
     Qnn_ContextHandle_t context = nullptr;
     Qnn_GraphHandle_t graph = nullptr;
+
+    // Kept alive for the model's lifetime: the queried tensor templates below point into its
+    // memory (dims/ids/name), so it must outlive inference and is freed in nativeClose.
+    QnnSystemContext_Handle_t sysCtxHandle = nullptr;
 
     // Tensor templates queried from the binary (shape/ids), filled with client buffers per call.
     Qnn_Tensor_t inputTensor{};
@@ -89,6 +106,50 @@ struct QnnDepthContext {
     size_t inputElems = 0;   // res*res*3
     size_t outputElems = 0;  // res*res
 };
+
+// The graph IO fields shared by GraphInfo V1/V2/V3 (same leading layout, different versions).
+struct GraphIO {
+    const char* name = nullptr;
+    Qnn_Tensor_t* inputs = nullptr;
+    uint32_t numInputs = 0;
+    Qnn_Tensor_t* outputs = nullptr;
+    uint32_t numOutputs = 0;
+};
+
+// Pull name + IO tensors out of a graph info record regardless of its struct version.
+bool extractGraphIO(const QnnSystemContext_GraphInfo_t* g, GraphIO* io) {
+    switch (g->version) {
+        case QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_1:
+            io->name = g->graphInfoV1.graphName;
+            io->inputs = g->graphInfoV1.graphInputs;   io->numInputs = g->graphInfoV1.numGraphInputs;
+            io->outputs = g->graphInfoV1.graphOutputs; io->numOutputs = g->graphInfoV1.numGraphOutputs;
+            return true;
+        case QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_2:
+            io->name = g->graphInfoV2.graphName;
+            io->inputs = g->graphInfoV2.graphInputs;   io->numInputs = g->graphInfoV2.numGraphInputs;
+            io->outputs = g->graphInfoV2.graphOutputs; io->numOutputs = g->graphInfoV2.numGraphOutputs;
+            return true;
+        case QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_3:
+            io->name = g->graphInfoV3.graphName;
+            io->inputs = g->graphInfoV3.graphInputs;   io->numInputs = g->graphInfoV3.numGraphInputs;
+            io->outputs = g->graphInfoV3.graphOutputs; io->numOutputs = g->graphInfoV3.numGraphOutputs;
+            return true;
+        default:
+            LOGE("unsupported graph-info version %d", (int)g->version);
+            return false;
+    }
+}
+
+// Point a tensor (v1 or v2) at a CPU client buffer, version-safely.
+void setRawClientBuf(Qnn_Tensor_t* t, void* data, uint32_t size) {
+    if (t->version == QNN_TENSOR_VERSION_2) {
+        t->v2.memType = QNN_TENSORMEMTYPE_RAW;
+        t->v2.clientBuf = { data, size };
+    } else {
+        t->v1.memType = QNN_TENSORMEMTYPE_RAW;
+        t->v1.clientBuf = { data, size };
+    }
+}
 
 // Resolve QnnInterface_getProviders from a dlopen'd backend lib and pick the first provider.
 bool loadCoreInterface(QnnDepthContext* c, const char* lib) {
@@ -158,6 +219,9 @@ bool inspectBinary(QnnDepthContext* c, const std::vector<uint8_t>& blob,
     } else if (binaryInfo->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_2) {
         graphs = binaryInfo->contextBinaryInfoV2.graphs;
         numGraphs = binaryInfo->contextBinaryInfoV2.numGraphs;
+    } else if (binaryInfo->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_3) {
+        graphs = binaryInfo->contextBinaryInfoV3.graphs;
+        numGraphs = binaryInfo->contextBinaryInfoV3.numGraphs;
     } else {
         LOGE("unsupported binary-info version %d", (int)binaryInfo->version);
         c->sys.systemContextFree(sysCtx);
@@ -165,9 +229,10 @@ bool inspectBinary(QnnDepthContext* c, const std::vector<uint8_t>& blob,
     }
     if (numGraphs == 0 || !graphs) { LOGE("binary has no graphs"); c->sys.systemContextFree(sysCtx); return false; }
     *graphInfoOut = &graphs[0];
-    // NOTE: graphInfo points into sysCtx-owned memory; caller must copy what it needs before
-    // freeing. We free in initFromBinary after copying tensor templates.
-    return true; // sysCtx intentionally leaked to caller scope; freed by caller.
+    // graphInfo (and the tensor templates it points to) lives in sysCtx-owned memory; keep the
+    // handle alive on the context and free it in nativeClose, after inference is done.
+    c->sysCtxHandle = sysCtx;
+    return true;
 }
 
 } // namespace
@@ -190,12 +255,18 @@ Java_com_lantern_recorder_recon_QnnNative_nativeInit(JNIEnv* env, jobject, jstri
         std::vector<uint8_t> blob = readFile(modelPath);
         if (blob.empty()) { LOGE("model file empty/unreadable: %s", modelPath); break; }
 
-        // Backend + device bring-up (HTP).
-        if (c->qnn.backendCreate(/*logger*/ nullptr, /*config*/ nullptr, &c->backend) != QNN_SUCCESS) {
-            LOGE("backendCreate failed"); break;
+        // Backend + device bring-up (HTP). Create a logger first so QNN's own diagnostics
+        // (the real reason for any device/context failure) reach logcat.
+        Qnn_ErrorHandle_t e;
+        if (c->qnn.logCreate(qnnLogCallback, QNN_LOG_LEVEL_VERBOSE, &c->logger) != QNN_SUCCESS) {
+            LOGW("logCreate failed; QNN backend logs won't be available");
+            c->logger = nullptr;
         }
-        if (c->qnn.deviceCreate(/*logger*/ nullptr, /*config*/ nullptr, &c->device) != QNN_SUCCESS) {
-            LOGW("deviceCreate failed; continuing with default device");
+        if ((e = c->qnn.backendCreate(c->logger, /*config*/ nullptr, &c->backend)) != QNN_SUCCESS) {
+            LOGE("backendCreate failed: 0x%llx", (unsigned long long)e); break;
+        }
+        if ((e = c->qnn.deviceCreate(c->logger, /*config*/ nullptr, &c->device)) != QNN_SUCCESS) {
+            LOGW("deviceCreate failed (0x%llx); continuing with default device", (unsigned long long)e);
             c->device = nullptr;
         }
 
@@ -203,22 +274,22 @@ Java_com_lantern_recorder_recon_QnnNative_nativeInit(JNIEnv* env, jobject, jstri
         const QnnSystemContext_GraphInfo_t* graphInfo = nullptr;
         if (!inspectBinary(c, blob, &graphInfo)) break;
 
-        if (c->qnn.contextCreateFromBinary(
+        if ((e = c->qnn.contextCreateFromBinary(
                 c->backend, c->device, /*config*/ nullptr,
-                blob.data(), blob.size(), &c->context, /*profile*/ nullptr) != QNN_SUCCESS) {
-            LOGE("contextCreateFromBinary failed"); break;
+                blob.data(), blob.size(), &c->context, /*profile*/ nullptr)) != QNN_SUCCESS) {
+            LOGE("contextCreateFromBinary failed: 0x%llx", (unsigned long long)e); break;
         }
 
-        // Retrieve the graph by the name embedded in the binary and copy its IO tensor templates.
-        const char* graphName = (graphInfo->version == QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_1)
-            ? graphInfo->graphInfoV1.graphName : graphInfo->graphInfoV1.graphName;
-        if (c->qnn.graphRetrieve(c->context, graphName, &c->graph) != QNN_SUCCESS) {
-            LOGE("graphRetrieve('%s') failed", graphName ? graphName : "?"); break;
+        // Read the graph's name + IO tensor templates (version-safe across GraphInfo V1/V2/V3).
+        GraphIO io;
+        if (!extractGraphIO(graphInfo, &io)) break;
+        if (c->qnn.graphRetrieve(c->context, io.name, &c->graph) != QNN_SUCCESS) {
+            LOGE("graphRetrieve('%s') failed", io.name ? io.name : "?"); break;
         }
         // DA3 is single-in/single-out; copy the descriptors so we can attach client buffers.
-        if (graphInfo->graphInfoV1.numGraphInputs >= 1 && graphInfo->graphInfoV1.numGraphOutputs >= 1) {
-            c->inputTensor = graphInfo->graphInfoV1.graphInputs[0];
-            c->outputTensor = graphInfo->graphInfoV1.graphOutputs[0];
+        if (io.numInputs >= 1 && io.numOutputs >= 1) {
+            c->inputTensor = io.inputs[0];
+            c->outputTensor = io.outputs[0];
         } else {
             LOGE("graph missing IO tensors"); break;
         }
@@ -227,6 +298,7 @@ Java_com_lantern_recorder_recon_QnnNative_nativeInit(JNIEnv* env, jobject, jstri
 
     env->ReleaseStringUTFChars(jModelPath, modelPath);
     if (!ok) {
+        if (c->sysCtxHandle) c->sys.systemContextFree(c->sysCtxHandle);
         if (c->context) c->qnn.contextFree(c->context, nullptr);
         if (c->backend) c->qnn.backendFree(c->backend);
         if (c->backendLibHandle) dlclose(c->backendLibHandle);
@@ -257,10 +329,8 @@ Java_com_lantern_recorder_recon_QnnNative_nativeInfer(
     // Point the (copied) tensor descriptors at our client buffers (CPU memory, RAW layout).
     Qnn_Tensor_t in = c->inputTensor;
     Qnn_Tensor_t out = c->outputTensor;
-    in.v1.memType = QNN_TENSORMEMTYPE_RAW;
-    in.v1.clientBuf = { input, static_cast<uint32_t>(c->inputElems * sizeof(float)) };
-    out.v1.memType = QNN_TENSORMEMTYPE_RAW;
-    out.v1.clientBuf = { output, static_cast<uint32_t>(c->outputElems * sizeof(float)) };
+    setRawClientBuf(&in, input, static_cast<uint32_t>(c->inputElems * sizeof(float)));
+    setRawClientBuf(&out, output, static_cast<uint32_t>(c->outputElems * sizeof(float)));
 
     Qnn_ErrorHandle_t err = c->qnn.graphExecute(
         c->graph, &in, 1, &out, 1, /*profile*/ nullptr, /*signal*/ nullptr);
@@ -277,6 +347,7 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_lantern_recorder_recon_QnnNative_nativeClose(JNIEnv*, jobject, jlong handle) {
     auto* c = reinterpret_cast<QnnDepthContext*>(handle);
     if (!c) return;
+    if (c->sysCtxHandle) c->sys.systemContextFree(c->sysCtxHandle);
     if (c->context) c->qnn.contextFree(c->context, nullptr);
     if (c->device) c->qnn.deviceFree(c->device);
     if (c->backend) c->qnn.backendFree(c->backend);

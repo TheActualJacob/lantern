@@ -26,6 +26,7 @@ private const val TAG = "LANTERN"
 class LiveReconstructor(
     da3ModelPath: String? = null,
     qnnModelPath: String? = null,
+    nativeLibDir: String? = null,
 ) {
     private val volume = TsdfVolume()
     private val arcoreDepth = ArCoreRawDepthSource()
@@ -36,7 +37,7 @@ class LiveReconstructor(
      * null when its model/runtime is absent, so this silently degrades on any device.
      */
     private val depth: DepthBackend? =
-        qnnModelPath?.let { QnnDlcDepthModel.loadOrNull(it) }
+        qnnModelPath?.let { QnnDlcDepthModel.loadOrNull(it, nativeLibDir) }
             ?: da3ModelPath?.let { ExecuTorchDepthModel.loadOrNull(it) }
 
     private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "live-recon").apply { isDaemon = true } }

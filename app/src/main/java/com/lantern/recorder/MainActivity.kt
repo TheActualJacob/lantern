@@ -170,7 +170,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         // directly `adb push`-able (/sdcard/Android/data/<pkg>/files/), then internal.
         val da3ModelPath = resolveDa3ModelPath()
         val qnnModelPath = resolveQnnModelPath()
-        liveReconstructor = LiveReconstructor(da3ModelPath, qnnModelPath)
+        liveReconstructor = LiveReconstructor(da3ModelPath, qnnModelPath, applicationInfo.nativeLibraryDir)
 
         frameRecorder = FrameRecorder(this)
         frameRecorder.onFrameSaved = { index, sessionName ->

@@ -91,7 +91,7 @@ class QnnDlcDepthModel private constructor(
          *  - the model file is missing, or
          *  - native init fails (unsupported SoC, wrong Hexagon skel, bad binary).
          */
-        fun loadOrNull(modelPath: String, res: Int = DEFAULT_RES): QnnDlcDepthModel? {
+        fun loadOrNull(modelPath: String, nativeLibDir: String? = null, res: Int = DEFAULT_RES): QnnDlcDepthModel? {
             if (!QnnNative.available) {
                 Log.i(TAG, "QNN native lib unavailable; skipping QNN depth backend")
                 return null
@@ -99,6 +99,20 @@ class QnnDlcDepthModel private constructor(
             if (!File(modelPath).exists()) {
                 Log.i(TAG, "QNN model not present ($modelPath); skipping QNN depth backend")
                 return null
+            }
+            // The HTP backend loads the Hexagon skel via fastRPC, which searches ADSP_LIBRARY_PATH.
+            // Add the app's extracted nativeLibraryDir (where libQnnHtpV79Skel.so lives) so the DSP
+            // can find it; without this, device/context bring-up fails (e.g. 0x36b1). Must be set
+            // before the native QNN init below.
+            if (nativeLibDir != null) {
+                try {
+                    val search = "$nativeLibDir;/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;" +
+                        "/vendor/lib64/rfsa/adsp;/system/lib/rfsa/adsp;/dsp"
+                    android.system.Os.setenv("ADSP_LIBRARY_PATH", search, true)
+                    Log.i(TAG, "ADSP_LIBRARY_PATH=$search")
+                } catch (t: Throwable) {
+                    Log.w(TAG, "could not set ADSP_LIBRARY_PATH: ${t.message}")
+                }
             }
             return try {
                 val handle = QnnNative.nativeInit(modelPath, res)
