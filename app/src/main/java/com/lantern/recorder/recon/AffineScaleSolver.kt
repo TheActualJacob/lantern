@@ -23,6 +23,9 @@ object AffineScaleSolver {
     private const val SATURATED_DEPTH_M = 65.0
     private const val MIN_SAMPLES = 16
 
+    /** Fractional depth band around the object distance used for the object-focused scale fit. */
+    private const val FOCUS_BAND = 0.4f
+
     /**
      * Combine a DA3 relative-disparity map with ARCore metric depth into a **dense metric
      * depth map** (meters, 0 = invalid) at the ARCore depth resolution.
@@ -34,11 +37,18 @@ object AffineScaleSolver {
         disp: DisparityMap,
         metric: DepthMap,
         confThreshold: Float = 0.5f,
+        focusDepthM: Float? = null,
     ): DepthMap? {
         val w = metric.width
         val h = metric.height
         val dispAtMetric = resizeNearest(disp, w, h)
-        val affine = solve(dispAtMetric, metric, confThreshold) ?: return null
+        // Prefer fitting the scale on the object's depth shell (so the background doesn't dominate
+        // the fit and shift the object frame-to-frame); fall back to a full-frame fit if the
+        // banded set is too small to solve.
+        val affine = (focusDepthM?.let { solve(dispAtMetric, metric, confThreshold, it) }
+            ?: solve(dispAtMetric, metric, confThreshold))
+            ?: solve(dispAtMetric, metric, confThreshold)
+            ?: return null
 
         val out = FloatArray(w * h)
         for (i in out.indices) {
@@ -48,20 +58,28 @@ object AffineScaleSolver {
         return DepthMap(w, h, out)
     }
 
-    /** Fit (s, t) over confident, valid, overlapping samples. Null if too few. */
+    /**
+     * Fit (s, t) over confident, valid, overlapping samples. Null if too few.
+     * If [focusDepthM] is given, only samples whose metric depth is within [FOCUS_BAND] of it are
+     * used, so the fit tracks the object rather than the background.
+     */
     fun solve(
         dispValues: FloatArray,
         metric: DepthMap,
         confThreshold: Float,
+        focusDepthM: Float? = null,
     ): Affine? {
         val depth = metric.depthMeters
         val conf = metric.confidence
         val n = depth.size
         val xs = ArrayList<Double>(n / 4)
         val ys = ArrayList<Double>(n / 4)
+        val near = focusDepthM?.let { it * (1f - FOCUS_BAND) }
+        val far = focusDepthM?.let { it * (1f + FOCUS_BAND) }
         for (i in 0 until n) {
             val dm = depth[i]
             if (dm <= 0.0f || dm.toDouble() >= SATURATED_DEPTH_M || !dm.isFinite()) continue
+            if (near != null && (dm < near || dm > far!!)) continue
             if (conf != null && conf[i] < confThreshold) continue
             val x = dispValues[i].toDouble()
             if (!x.isFinite()) continue

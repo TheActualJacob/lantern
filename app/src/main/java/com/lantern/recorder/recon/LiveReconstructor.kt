@@ -139,12 +139,16 @@ class LiveReconstructor(
     ) {
         val depthIntrinsics = intrinsics.scaledTo(arcoreMetric.width, arcoreMetric.height)
 
+        // Distance to whatever's centered in view (the object); used to focus the depth-scale
+        // fit on the object instead of the background.
+        val focusDepth = centerMedianDepth(arcoreMetric)
+
         // Prefer DA3 dense metric depth (scaled vs ARCore) when available.
         var fusionDepth = arcoreMetric
         if (argb != null && depth != null) {
             val disp = depth.inferDisparity(argb)
             if (disp != null) {
-                val dense = AffineScaleSolver.buildMetricDepth(disp, arcoreMetric)
+                val dense = AffineScaleSolver.buildMetricDepth(disp, arcoreMetric, focusDepthM = focusDepth)
                 if (dense != null) fusionDepth = dense
             }
         }
@@ -191,12 +195,8 @@ class LiveReconstructor(
         return dx * dx + dy * dy + dz * dz > REANCHOR_DIST_M * REANCHOR_DIST_M
     }
 
-    /** Median center-window depth back-projected along the camera's forward ray. */
-    private fun estimateCentroidWorld(
-        depth: DepthMap,
-        intrinsics: CameraIntrinsics,
-        cameraToWorld: FloatArray,
-    ): FloatArray? {
+    /** Median depth (m) over the center window of the frame — the distance to the centered object. */
+    private fun centerMedianDepth(depth: DepthMap): Float? {
         val cw = depth.width / 4
         val ch = depth.height / 4
         val cx = depth.width / 2
@@ -210,7 +210,16 @@ class LiveReconstructor(
         }
         if (samples.size < 8) return null
         samples.sort()
-        val median = samples[samples.size / 2]
+        return samples[samples.size / 2]
+    }
+
+    /** Center-window object distance back-projected along the camera's forward ray (world point). */
+    private fun estimateCentroidWorld(
+        depth: DepthMap,
+        intrinsics: CameraIntrinsics,
+        cameraToWorld: FloatArray,
+    ): FloatArray? {
+        val median = centerMedianDepth(depth) ?: return null
 
         // Camera world position + ARCore forward (-Z axis of the rotation) * median depth.
         val px = cameraToWorld[3]
@@ -241,9 +250,11 @@ class LiveReconstructor(
         private const val KEYFRAME_TRANSLATION_M = 0.02f // 2 cm between fused keyframes
         private const val EXTRACT_EVERY = 5 // re-mesh every N integrations (marching cubes is heavy)
 
-        // Re-lock onto a new object when the look-target sits more than this from the current
-        // anchor for REANCHOR_FRAMES keyframes (debounced so orbiting one object doesn't reset).
-        private const val REANCHOR_DIST_M = 0.22f
-        private const val REANCHOR_FRAMES = 3
+        // Re-lock onto a new object only when the look-target leaves the current volume entirely
+        // (well beyond the object) for REANCHOR_FRAMES *consecutive* keyframes. Deliberately large
+        // + long so orbiting a single object — where the centroid wanders with handheld motion —
+        // never wipes the accumulating scan; only genuinely moving to a new object/area resets.
+        private const val REANCHOR_DIST_M = 0.45f
+        private const val REANCHOR_FRAMES = 8
     }
 }
