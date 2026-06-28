@@ -47,8 +47,14 @@ class LiveReconstructor(
 
     val segActive: Boolean get() = seg != null
 
+    // Two workers, two cadences. [worker] runs the *fast* preview (FastSAM mask + debug overlay,
+    // ~tens of ms) every gated frame so the live mask tracks the object in real time. [fusionWorker]
+    // runs the *heavy* path (DA3 dense depth ~seconds on CPU + TSDF fusion + marching cubes) and
+    // drops frames that arrive while it's busy — so dense-depth latency never freezes the mask.
     private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "live-recon").apply { isDaemon = true } }
     private val busy = AtomicBoolean(false)
+    private val fusionWorker = Executors.newSingleThreadExecutor { r -> Thread(r, "live-fusion").apply { isDaemon = true } }
+    private val fusionBusy = AtomicBoolean(false)
     private val meshRef = AtomicReference(MeshData.EMPTY)
     private val versionRef = AtomicReference(0)
 
@@ -131,7 +137,8 @@ class LiveReconstructor(
     }
 
     fun reset() {
-        worker.execute {
+        // Volume/tracker/mesh are owned by the fusion worker — reset there to avoid racing a fuse.
+        fusionWorker.execute {
             volume.reset()
             tracker.reset()
             lastKeyframePos = null
@@ -239,10 +246,14 @@ class LiveReconstructor(
 
         // Object mask (FastSAM) aligned to the depth image; gates the scale fit and fusion so only
         // the segmented object is reconstructed. Null when segmentation is off/nothing at center.
+        val tSam0 = System.nanoTime()
         val mask = if (argb != null && seg != null) {
             seg.inferObjectMask(argb, arcoreMetric.width, arcoreMetric.height)
         } else {
             null
+        }
+        if (debugEnabled) {
+            Log.i(TAG, "PERF sam=${(System.nanoTime() - tSam0) / 1_000_000L}ms maskNull=${mask == null}")
         }
 
         if (debugEnabled && argb != null) {
@@ -263,24 +274,61 @@ class LiveReconstructor(
             return
         }
 
+        // Hand the freshest masked frame to the (slow) DA3 + fusion worker. SAM + the debug overlay
+        // above already ran this frame for a real-time mask; DA3 (~seconds on CPU) + TSDF fusion run
+        // on a separate worker that drops intermediate frames while busy, so dense-depth latency
+        // never freezes the live mask/preview.
+        if (fusionBusy.compareAndSet(false, true)) {
+            val job = FusionJob(arcoreMetric, argb, mask, focusDepth, depthIntrinsics, cameraToWorld)
+            fusionWorker.execute {
+                try {
+                    runFusion(job)
+                } catch (t: Throwable) {
+                    Log.e(TAG, "live fusion worker failed", t)
+                } finally {
+                    fusionBusy.set(false)
+                }
+            }
+        }
+    }
+
+    /** Snapshot handed from the fast preview path to the heavy DA3 + TSDF fusion worker. */
+    private class FusionJob(
+        val arcoreMetric: DepthMap,
+        val argb: ImageUtils.Argb?,
+        val mask: FloatArray?,
+        val focusDepth: Float?,
+        val depthIntrinsics: CameraIntrinsics,
+        val cameraToWorld: FloatArray,
+    )
+
+    /**
+     * Heavy per-frame work, decoupled from the live mask preview: DA3 dense metric depth (scaled vs
+     * ARCore) then TSDF fusion (world-frame for the orbit case, ICP for in-hand). Runs on
+     * [fusionWorker]; frames arriving while it's busy are dropped — the preview keeps tracking.
+     */
+    private fun runFusion(job: FusionJob) {
+        val arcoreMetric = job.arcoreMetric
         // Prefer DA3 dense metric depth (scaled vs ARCore) when available.
-        var fusionDepth = arcoreMetric
+        var fusionDepth: DepthMap = arcoreMetric
         val denseBackend = depth // capture the volatile var for a stable smart-cast
-        if (argb != null && denseBackend != null) {
-            val disp = denseBackend.inferDisparity(argb)
+        val tDa30 = System.nanoTime()
+        if (job.argb != null && denseBackend != null) {
+            val disp = denseBackend.inferDisparity(job.argb)
             if (disp != null) {
                 val dense = AffineScaleSolver.buildMetricDepth(
-                    disp, arcoreMetric, focusDepthM = focusDepth, mask = mask,
+                    disp, arcoreMetric, focusDepthM = job.focusDepth, mask = job.mask,
                 )
                 if (dense != null) fusionDepth = dense
             }
         }
+        if (debugEnabled) Log.i(TAG, "PERF da3=${(System.nanoTime() - tDa30) / 1_000_000L}ms")
 
         // Without segmentation there's nothing to track: keep the original world-frame behavior —
         // center once on the look point, re-anchor only after a sustained move, and fuse every
         // frame (the geometric ground/cylinder culls keep the floor out in this mode).
         if (seg == null) {
-            val centroid = estimateCentroidWorld(fusionDepth, depthIntrinsics, cameraToWorld)
+            val centroid = estimateCentroidWorld(fusionDepth, job.depthIntrinsics, job.cameraToWorld)
             if (centroid != null) {
                 if (!volume.isCentered) {
                     volume.centerOn(centroid[0], centroid[1], centroid[2]); reanchorStreak = 0
@@ -293,7 +341,7 @@ class LiveReconstructor(
                 } else reanchorStreak = 0
             }
             if (!volume.isCentered) return
-            fuse(fusionDepth, depthIntrinsics, cameraToWorld, mask)
+            fuse(fusionDepth, job.depthIntrinsics, job.cameraToWorld, job.mask)
             return
         }
 
@@ -306,9 +354,9 @@ class LiveReconstructor(
         //  * Object turned in hand: ARCore camera pose no longer encodes the object's motion, so we
         //    must register cloud-to-model with ICP (fragile on low-relief/smooth objects).
         if (SEG_USE_ARCORE_POSE) {
-            fuseStaticObject(cameraToWorld, fusionDepth, depthIntrinsics, mask!!)
+            fuseStaticObject(job.cameraToWorld, fusionDepth, job.depthIntrinsics, job.mask!!)
         } else {
-            trackAndFuse(cameraToWorld, fusionDepth, depthIntrinsics, mask!!)
+            trackAndFuse(job.cameraToWorld, fusionDepth, job.depthIntrinsics, job.mask!!)
         }
     }
 
@@ -603,11 +651,10 @@ class LiveReconstructor(
 
     fun close() {
         running = false
-        worker.execute {
-            depth?.close()
-            seg?.close()
-        }
+        worker.execute { seg?.close() }
+        fusionWorker.execute { depth?.close() }
         worker.shutdown()
+        fusionWorker.shutdown()
     }
 
     companion object {

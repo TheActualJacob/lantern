@@ -309,16 +309,22 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
      *
      * This is the **XNNPACK CPU** export (exported by `export_da3_executorch.py --backend
      * xnnpack`). It runs on CPU so it does NOT contend with FastSAM on the Hexagon NPU — a
-     * second QNN/HTP context fails `nativeInit` while SAM holds the NPU. CPU DA3-Small is
-     * ~0.5 s/frame, fine for keyframe-cadence dense depth.
+     * second QNN/HTP context fails `nativeInit` while SAM holds the NPU.
+     *
+     * On the S25 CPU the full 518-res export is ~2.8 s/frame, so we prefer a reduced-resolution
+     * export (`..._r<N>.pte`, e.g. r350 ≈ 0.46x the patch tokens) when present — the loader reads
+     * the resolution back out of the `_r<N>` suffix. Falls back to the 518 model, then either path
+     * (so the log points the user at the right place; the loader degrades to ARCore depth if absent).
      */
     private fun resolveDa3ModelPath(): String {
-        val name = "da3_small_xnnpack.pte"
-        val external = getExternalFilesDir(null)?.let { File(it, name) }
-        if (external != null && external.exists()) return external.absolutePath
-        val internal = File(filesDir, name)
-        if (internal.exists()) return internal.absolutePath
-        return (external ?: internal).absolutePath
+        // Lowest-res first (fastest); 518 baseline last.
+        val candidates = listOf("da3_small_xnnpack_r350.pte", "da3_small_xnnpack.pte")
+        for (name in candidates) {
+            getExternalFilesDir(null)?.let { File(it, name) }?.takeIf { it.exists() }?.let { return it.absolutePath }
+            File(filesDir, name).takeIf { it.exists() }?.let { return it.absolutePath }
+        }
+        val name = candidates.first()
+        return (getExternalFilesDir(null)?.let { File(it, name) } ?: File(filesDir, name)).absolutePath
     }
 
     /**
@@ -475,6 +481,12 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
 
         surfaceView.onResume()
         displayRotationHelper.onResume()
+
+        // Live Mesh is the only mode and runs independent of the recorder, so (re)start its
+        // reconstruction on resume — onPause stops it, and there's no longer a mode tap to do so.
+        if (uiState.captureMode == CaptureMode.LiveMesh && !frameRecorder.isRecording) {
+            onSelectCaptureMode(CaptureMode.LiveMesh)
+        }
     }
 
     override fun onPause() {

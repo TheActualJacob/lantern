@@ -94,11 +94,17 @@ class ExecuTorchDepthModel private constructor(
         /** Default DA3-Small working resolution (matches the Qualcomm NPU export). */
         const val DEFAULT_RES = 518
 
+        /** Parse the fixed input resolution from a `..._r<N>.pte` filename, else [DEFAULT_RES]. */
+        private fun resFromName(modelPath: String): Int =
+            Regex("_r(\\d+)\\.pte$").find(modelPath)?.groupValues?.get(1)?.toIntOrNull() ?: DEFAULT_RES
+
         /**
-         * Load a DA3 `.pte` from an absolute filesystem path. Returns null if the file is
-         * missing or the runtime can't load it (caller falls back to ARCore-only depth).
+         * Load a DA3 `.pte` from an absolute filesystem path. The input resolution is read from a
+         * `_r<N>` suffix in the filename when present (the ExecuTorch input rank/shape is fixed at
+         * export time and must match), otherwise [DEFAULT_RES]. Returns null if the file is missing
+         * or the runtime can't load it (caller falls back to ARCore-only depth).
          */
-        fun loadOrNull(modelPath: String, res: Int = DEFAULT_RES): ExecuTorchDepthModel? {
+        fun loadOrNull(modelPath: String, res: Int = resFromName(modelPath)): ExecuTorchDepthModel? {
             return try {
                 val module = Module.load(modelPath)
                 Log.i(TAG, "Loaded DA3 ExecuTorch model: $modelPath (res=$res)")

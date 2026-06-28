@@ -648,12 +648,10 @@ private fun TopPanel(
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             Box(contentAlignment = Alignment.CenterStart) {
-                when {
-                    !state.isRecording && state.depthSupported ->
-                        CaptureModeToggle(state.captureMode, turntableAvailable, onSetCaptureMode)
-                    state.isRecording && state.twoPassEnabled && inFlow ->
-                        PassIndicator(state.scanPhase)
-                    else -> {}
+                // Live Mesh is the only capture mode now, so there's no mode selector. The pass
+                // indicator still shows during a two-sided recording.
+                if (state.isRecording && state.twoPassEnabled && inFlow) {
+                    PassIndicator(state.scanPhase)
                 }
             }
             HelpButton(onOpenHelp)

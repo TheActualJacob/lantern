@@ -102,8 +102,8 @@ class CaptureUiState {
     var savedConfirmation by mutableStateOf<SavedConfirmation?>(null)
         private set
 
-    /** Selected capture mode (orbit vs turntable). Switchable only while idle. */
-    var captureMode by mutableStateOf(CaptureMode.Orbit)
+    /** Capture mode. The app is now Live Mesh only; kept as a field for the recorder/pose plumbing. */
+    var captureMode by mutableStateOf(CaptureMode.LiveMesh)
         private set
 
     /**
