@@ -33,6 +33,10 @@ class MaskOverlayRenderer {
     @Volatile private var pendingH = 0
     @Volatile private var hasMask = false
 
+    // Whether [quadTexCoords] has been filled from ARCore's NDC->image transform yet. Until then the
+    // buffer is all zeros, which would sample one texel across the whole quad (overlay invisible).
+    private var texCoordsValid = false
+
     fun createOnGlThread() {
         val textures = IntArray(1)
         GLES20.glGenTextures(1, textures, 0)
@@ -72,8 +76,24 @@ class MaskOverlayRenderer {
     }
 
     fun draw(frame: Frame) {
-        if (!hasMask) return
         if (frame.timestamp == 0L) return
+
+        // Map the NDC quad into camera-image-normalized coords (the mask's space). Recompute on
+        // geometry change AND on first use: the change event fires once early in the session — often
+        // before any mask exists — so gating only on it (plus the !hasMask early-return below) would
+        // leave the texcoords zeroed when the first mask finally arrives, hiding the overlay until a
+        // later rotation happened to re-fire the event. Consuming it here every frame fixes that.
+        if (frame.hasDisplayGeometryChanged() || !texCoordsValid) {
+            frame.transformCoordinates2d(
+                Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES,
+                quadCoords,
+                Coordinates2d.IMAGE_NORMALIZED,
+                quadTexCoords,
+            )
+            texCoordsValid = true
+        }
+
+        if (!hasMask) return
 
         val upload = pendingMask
         if (upload != null) {
@@ -86,16 +106,6 @@ class MaskOverlayRenderer {
             )
         }
 
-        // Map the NDC quad into camera-image-normalized coords (the mask's space). Recompute on
-        // geometry change; the mapping is pose-independent so it only shifts on display rotation.
-        if (frame.hasDisplayGeometryChanged()) {
-            frame.transformCoordinates2d(
-                Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES,
-                quadCoords,
-                Coordinates2d.IMAGE_NORMALIZED,
-                quadTexCoords,
-            )
-        }
         quadCoords.position(0)
         quadTexCoords.position(0)
 
