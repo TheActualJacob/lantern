@@ -307,10 +307,73 @@ class BatchReconstructor(
             Log.w(TAG, "BatchReconstructor(MV): too few points after density filter (${v.size / 3})")
             return MeshData.EMPTY
         }
+
+        if (HULL_FILL) {
+            // "Find a hull and fill it": trim stray background, then wrap the cloud in a watertight
+            // convex hull. Robust to the partial-shell / layered-views problem (overlapping shells
+            // collapse into one solid) and yields real triangles for OBJ export. Convex-only — fills
+            // concavities, fine for cans/boxes/cases. Falls back to the raw cloud if the hull fails.
+            progress?.update(1, 1, "Filling hull…")
+            val core = trimToCentralCluster(v, HULL_TRIM_PCT)
+            val hull = ConvexHull3D.compute(core)
+            if (!hull.isEmpty) {
+                Log.i(TAG, "BatchReconstructor(MV): hull ${hull.vertexCount} verts / ${hull.triangleCount} tris from $n views")
+                // The renderer draws triangle soup (glDrawArrays, sequential order like marching
+                // cubes); expand the indexed hull so its faces render and the OBJ stays valid.
+                return expandToSoup(hull)
+            }
+            Log.w(TAG, "BatchReconstructor(MV): hull failed; returning point cloud")
+        }
+
         progress?.update(1, 1, "Finishing…")
         val normals = FloatArray(v.size) { if (it % 3 == 1) 1f else 0f }
         Log.i(TAG, "BatchReconstructor(MV): point cloud ${v.size / 3} points from $n views")
         return MeshData(v, normals, IntArray(0))
+    }
+
+    /**
+     * Convert an indexed [mesh] to triangle soup (3 fresh vertices per face, sequential indices) —
+     * the order [com.lantern.recorder.rendering.MeshRenderer] draws with `glDrawArrays`. Vertex
+     * normals are carried through per corner so the surface still shades smoothly.
+     */
+    private fun expandToSoup(mesh: MeshData): MeshData {
+        val idx = mesh.indices
+        if (idx.isEmpty()) return mesh
+        val sv = mesh.vertices
+        val sn = mesh.normals
+        val hasN = sn.size == sv.size
+        val v = FloatArray(idx.size * 3)
+        val nrm = FloatArray(idx.size * 3)
+        for (k in idx.indices) {
+            val s = idx[k] * 3
+            val d = k * 3
+            v[d] = sv[s]; v[d + 1] = sv[s + 1]; v[d + 2] = sv[s + 2]
+            if (hasN) { nrm[d] = sn[s]; nrm[d + 1] = sn[s + 1]; nrm[d + 2] = sn[s + 2] } else nrm[d + 1] = 1f
+        }
+        return MeshData(v, nrm, IntArray(idx.size) { it })
+    }
+
+    /** Drop points beyond the [pct]-percentile distance from the cloud median — removes stray
+     *  background chunks that would balloon the convex hull. Returns the surviving flat-xyz points. */
+    private fun trimToCentralCluster(v: FloatArray, pct: Int): FloatArray {
+        val n = v.size / 3
+        if (n < 8) return v
+        var mx = 0f; var my = 0f; var mz = 0f
+        // Median via per-axis sort (robust center; mean would chase outliers).
+        val xs = FloatArray(n); val ys = FloatArray(n); val zs = FloatArray(n)
+        for (i in 0 until n) { xs[i] = v[i * 3]; ys[i] = v[i * 3 + 1]; zs[i] = v[i * 3 + 2] }
+        xs.sort(); ys.sort(); zs.sort()
+        mx = xs[n / 2]; my = ys[n / 2]; mz = zs[n / 2]
+        val d = FloatArray(n)
+        for (i in 0 until n) {
+            val dx = v[i * 3] - mx; val dy = v[i * 3 + 1] - my; val dz = v[i * 3 + 2] - mz
+            d[i] = dx * dx + dy * dy + dz * dz
+        }
+        val sorted = d.clone(); sorted.sort()
+        val thr = sorted[((n * pct / 100).coerceIn(0, n - 1))]
+        val out = ArrayList<Float>(n * 3)
+        for (i in 0 until n) if (d[i] <= thr) { out.add(v[i * 3]); out.add(v[i * 3 + 1]); out.add(v[i * 3 + 2]) }
+        return out.toFloatArray()
     }
 
     /** Pick exactly [n] keyframes: even spread if more were captured, cyclic pad if fewer. */
@@ -496,6 +559,13 @@ class BatchReconstructor(
 
         /** Multi-view: drop the lowest this-percent of masked pixels by DA3 confidence per view. */
         private const val CONF_DROP_PCT = 20
+
+        // Convex-hull "fill" for the multi-view cloud: wraps the points in a watertight solid.
+        // Robust to partial/layered shells; convex-only (fills concavities). Toggle off for raw cloud.
+        private const val HULL_FILL = true
+        // Keep points within this distance percentile of the cloud median before hulling (drops
+        // background floaters that would otherwise balloon the hull).
+        private const val HULL_TRIM_PCT = 92
 
         // Multi-view per-view mask sanity gate (reject background grabs / off-center latches):
         private const val MV_MIN_MASK_PIX = 400          // too few object pixels => empty/failed mask
