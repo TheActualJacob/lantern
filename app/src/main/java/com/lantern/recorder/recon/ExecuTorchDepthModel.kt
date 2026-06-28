@@ -34,7 +34,11 @@ class ExecuTorchDepthModel private constructor(
      */
     override fun inferDisparity(argb: ImageUtils.Argb): DisparityMap? {
         return try {
-            val input = preprocess(argb)
+            // Aspect-preserving letterbox into the square net input (matches FastSAM's preprocessing),
+            // so DA3 sees the object undistorted. Squishing a 4:3 image into a square warps geometry
+            // ~33% horizontally, which is why the depth surface didn't line up with the SAM mask.
+            val lb = Letterbox(argb.width, argb.height, res)
+            val input = preprocess(argb, lb)
             // DA3's net is multi-view: forward expects (B, N, 3, H, W) with N=1 for a single
             // image. ExecuTorch input ranks are immutable, so a 4D tensor fails with
             // "Error resizing tensor at input 0" (rank 5 -> 4). Same NCHW data, 5D shape.
@@ -49,34 +53,60 @@ class ExecuTorchDepthModel private constructor(
                 Log.w(TAG, "DA3 output ${depth.size} < ${res * res}")
                 return null
             }
-            DisparityMap(res, res, depthToDisparity(depth, res))
+            val disp = depthToDisparity(depth, res)
+            // Crop the padded content region back out, yielding a disparity map that maps *uniformly*
+            // onto the source image (newW x newH) — exactly the grid FastSAM's mask uses, so mask and
+            // depth share pixels downstream with no further bookkeeping.
+            cropLetterbox(disp, lb)
         } catch (t: Throwable) {
             Log.e(TAG, "DA3 inference failed", t)
             null
         }
     }
 
-    /** ARGB -> normalized NCHW float32 RGB at [res]x[res] (nearest resize, ImageNet norm). */
-    private fun preprocess(argb: ImageUtils.Argb): FloatArray {
+    /** ARGB -> normalized NCHW float32 RGB at [res]x[res], aspect-preserving with centered padding. */
+    private fun preprocess(argb: ImageUtils.Argb, lb: Letterbox): FloatArray {
+        // Pad value = normalized 0 (i.e. the ImageNet mean), a neutral gray like YOLO/FastSAM uses.
         val out = FloatArray(3 * res * res)
         val planeStride = res * res
-        val sx = argb.width.toFloat() / res
-        val sy = argb.height.toFloat() / res
-        for (oy in 0 until res) {
+        val sx = argb.width.toFloat() / lb.newW
+        val sy = argb.height.toFloat() / lb.newH
+        for (oy in 0 until lb.newH) {
             val srcY = (oy * sy).toInt().coerceIn(0, argb.height - 1)
-            for (ox in 0 until res) {
+            val rowBase = srcY * argb.width
+            val dstY = lb.padY + oy
+            for (ox in 0 until lb.newW) {
                 val srcX = (ox * sx).toInt().coerceIn(0, argb.width - 1)
-                val p = argb.pixels[srcY * argb.width + srcX]
+                val p = argb.pixels[rowBase + srcX]
                 val r = ((p shr 16) and 0xFF) / 255f
                 val g = ((p shr 8) and 0xFF) / 255f
                 val b = (p and 0xFF) / 255f
-                val o = oy * res + ox
+                val o = dstY * res + (lb.padX + ox)
                 out[o] = (r - IMAGENET_MEAN[0]) / IMAGENET_STD[0]
                 out[planeStride + o] = (g - IMAGENET_MEAN[1]) / IMAGENET_STD[1]
                 out[2 * planeStride + o] = (b - IMAGENET_MEAN[2]) / IMAGENET_STD[2]
             }
         }
         return out
+    }
+
+    /** Aspect-preserving fit of [srcW]x[srcH] into a [target]-square with centered padding. */
+    private class Letterbox(srcW: Int, srcH: Int, target: Int) {
+        val scale = target.toFloat() / maxOf(srcW, srcH)
+        val newW = (srcW * scale).toInt().coerceIn(1, target)
+        val newH = (srcH * scale).toInt().coerceIn(1, target)
+        val padX = (target - newW) / 2
+        val padY = (target - newH) / 2
+    }
+
+    /** Extract the unpadded content rectangle from a [res]x[res] disparity map. */
+    private fun cropLetterbox(disp: FloatArray, lb: Letterbox): DisparityMap {
+        val out = FloatArray(lb.newW * lb.newH)
+        for (y in 0 until lb.newH) {
+            val srcRow = (lb.padY + y) * res + lb.padX
+            System.arraycopy(disp, srcRow, out, y * lb.newW, lb.newW)
+        }
+        return DisparityMap(lb.newW, lb.newH, out)
     }
 
     override fun close() {

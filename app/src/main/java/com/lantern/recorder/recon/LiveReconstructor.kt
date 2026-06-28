@@ -52,6 +52,11 @@ class LiveReconstructor(
      *  Touched only on the preview worker. */
     private val maskStabilizer = MaskStabilizer()
 
+    /** Single, stable DA3 disparity->metric scale for the whole scan. Replaces per-frame fitting
+     *  against noisy ARCore depth (which jittered the object's size/pose and smeared the mesh).
+     *  Touched only on the fusion worker. */
+    private val scaleTracker = DepthScaleTracker()
+
     // Two workers, two cadences. [worker] runs the *fast* preview (FastSAM mask + debug overlay,
     // ~tens of ms) every gated frame so the live mask tracks the object in real time. [fusionWorker]
     // runs the *heavy* path (DA3 dense depth ~seconds on CPU + TSDF fusion + marching cubes) and
@@ -133,6 +138,22 @@ class LiveReconstructor(
     /** Which dense-depth runtime is live (for the UI readout); ARCORE when no model loaded. */
     val depthBackend: DepthBackendKind get() = depth?.kind ?: DepthBackendKind.ARCORE
 
+    /**
+     * A [BatchReconstructor] sharing this reconstructor's already-loaded DA3 + FastSAM models, for
+     * directed-capture's end-of-capture build pass. Reusing the loaded models avoids a second
+     * ~100 MB DA3 load and a second QNN/NPU context (which would contend with the live segmenter).
+     * Call only when live fusion is stopped (directed mode), so the models aren't used concurrently.
+     */
+    fun newBatchReconstructor(): BatchReconstructor = BatchReconstructor(depth, seg)
+
+    /**
+     * Run FastSAM once on [argb], returning the object mask at [outW]x[outH] (1=object, 0=background)
+     * or null if no segmenter / nothing found. For the directed-capture live preview overlay; call
+     * off the GL thread (NPU). Independent of live fusion, so it's safe while [running] is false.
+     */
+    fun inferPreviewMask(argb: ImageUtils.Argb, outW: Int, outH: Int): FloatArray? =
+        seg?.inferObjectMask(argb, outW, outH)
+
     fun start() {
         running = true
     }
@@ -148,6 +169,7 @@ class LiveReconstructor(
         fusionWorker.execute {
             volume.reset()
             tracker.reset()
+            scaleTracker.reset()
             lastKeyframePos = null
             integratedFrames = 0
             reanchorStreak = 0
@@ -323,20 +345,29 @@ class LiveReconstructor(
      */
     private fun runFusion(job: FusionJob) {
         val arcoreMetric = job.arcoreMetric
-        // Prefer DA3 dense metric depth (scaled vs ARCore) when available.
+        // Geometry comes from DA3 dense depth. ARCore depth is *only* used to fit a one-time scale
+        // (DA3 is relative), which we lock via [scaleTracker] so its per-frame noise stops warping
+        // the mesh. Fall back to raw ARCore depth solely when no DA3 model is loaded at all.
         var fusionDepth: DepthMap = arcoreMetric
         val denseBackend = depth // capture the volatile var for a stable smart-cast
         val tDa30 = System.nanoTime()
         if (job.argb != null && denseBackend != null) {
             val disp = denseBackend.inferDisparity(job.argb)
-            if (disp != null) {
-                val dense = AffineScaleSolver.buildMetricDepth(
-                    disp, arcoreMetric, focusDepthM = job.focusDepth, mask = job.mask,
-                )
-                if (dense != null) fusionDepth = dense
-            }
+                ?: return // DA3 failed this frame; skip rather than fuse noisy ARCore depth.
+            val candidate = AffineScaleSolver.fitAffine(
+                disp, arcoreMetric, focusDepthM = job.focusDepth, mask = job.mask,
+            )
+            val scale = scaleTracker.update(candidate)
+                ?: return // global scale not established yet (warmup); don't fuse until it locks in.
+            fusionDepth = AffineScaleSolver.applyAffine(
+                disp, arcoreMetric.width, arcoreMetric.height, scale,
+            )
         }
-        if (debugEnabled) Log.i(TAG, "PERF da3=${(System.nanoTime() - tDa30) / 1_000_000L}ms")
+        if (debugEnabled) {
+            Log.i(TAG, "PERF da3=${(System.nanoTime() - tDa30) / 1_000_000L}ms " +
+                "scale=${"%.3f".format(scaleTracker.s)},${"%.3f".format(scaleTracker.t)} " +
+                "locked=${scaleTracker.locked}")
+        }
 
         // Without segmentation there's nothing to track: keep the original world-frame behavior —
         // center once on the look point, re-anchor only after a sustained move, and fuse every
@@ -597,6 +628,8 @@ class LiveReconstructor(
                 append("mode=ICP  track: frames=${tracker.trackedFrames} ")
                 append("fit=${"%.2f".format(tracker.lastFitness)} modelVox=${tracker.modelVoxelCount}\n")
             }
+            append("scale=${"%.3f".format(scaleTracker.s)},${"%.3f".format(scaleTracker.t)} ")
+            append("${if (scaleTracker.locked) "LOCKED" else if (scaleTracker.ready) "warming" else "—"}\n")
             append("centered=${volume.isCentered}  fused=$integratedFrames\n")
             append("depth=${w}x$h  argb=${argb.width}x${argb.height}")
         }

@@ -37,8 +37,12 @@ import com.lantern.recorder.recording.OpenCvBoardDetector
 import com.lantern.recorder.recording.OrbitPoseProvider
 import com.lantern.recorder.recording.PoseProvider
 import com.lantern.recorder.recording.TurntablePoseProvider
+import com.lantern.recorder.recon.BatchReconstructor
 import com.lantern.recorder.recon.CameraIntrinsics
+import com.lantern.recorder.recon.DepthMap
+import com.lantern.recorder.recon.ImageUtils
 import com.lantern.recorder.recon.LiveReconstructor
+import com.lantern.recorder.recon.MeshData
 import com.lantern.recorder.recon.MeshExport
 import com.lantern.recorder.rendering.BackgroundRenderer
 import com.lantern.recorder.rendering.DisplayRotationHelper
@@ -58,10 +62,14 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.abs
 import kotlin.math.acos
+import kotlin.math.atan2
+import kotlin.math.sqrt
 
 /**
  * Brings up an ARCore session, renders the live camera feed into a [GLSurfaceView],
@@ -76,6 +84,7 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private lateinit var displayRotationHelper: DisplayRotationHelper
 
     private val backgroundRenderer = BackgroundRenderer()
+    private val maskOverlayRenderer = com.lantern.recorder.rendering.MaskOverlayRenderer()
     private lateinit var frameRecorder: FrameRecorder
 
     // Board-free live mesh (recon package): ARCore depth + optional on-device DA3 depth
@@ -91,6 +100,43 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     private var lastLiveMeshVersion = -1
     private var lastExportedMeshVersion = -1
     private var lastLiveStatsMs = 0L
+
+    // ----- Directed capture (deliberate keyframes -> build at end) -----
+    // In-memory keyframes (full-res color + ARCore depth + pose + intrinsics). Written on the GL
+    // thread, snapshot-copied on the build worker. No 16-bit-PNG round-trip (Android can't decode
+    // those back), so the build consumes these directly.
+    private val batchFrames = java.util.Collections.synchronizedList(ArrayList<BatchReconstructor.Keyframe>())
+    @Volatile private var directedActive = false
+    @Volatile private var directedBuilding = false
+    @Volatile private var directedSnapRequested = false
+    private val directedSectors = BooleanArray(CaptureUiState.AZIMUTH_SECTORS)
+    // Running object-centroid estimate for the directed coverage ring (camera + forward*centerDepth).
+    private var dirCentroidSumX = 0f
+    private var dirCentroidSumY = 0f
+    private var dirCentroidSumZ = 0f
+    private var dirCentroidSamples = 0
+    // Steadiness gate: auto-fire only when the phone is holding roughly still on a new angle.
+    private var dirLastCamX = 0f
+    private var dirLastCamY = 0f
+    private var dirLastCamZ = 0f
+    private var dirHasLastCam = false
+    private var dirLastCaptureNs = 0L
+    private var dirLastRingMs = 0L
+    private val batchWorker = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "directed-build").apply { isDaemon = true }
+    }
+    @Volatile private var directedMesh: MeshData? = null
+    private var directedMeshVersion = 0
+    private var lastDirectedMeshDrawn = -1
+    @Volatile private var directedModelPath: String? = null
+    // Live FastSAM preview (Guided mode): segment on a worker so the heavy NPU call never blocks GL.
+    private val previewWorker = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "directed-preview").apply { isDaemon = true }
+    }
+    private val previewBusy = AtomicBoolean(false)
+    private var dirLastPreviewMs = 0L
+    @Volatile private var surfaceW = 0
+    @Volatile private var surfaceH = 0
 
     /** Compose-observable mirror of capture state, updated on the UI thread. */
     private val uiState = CaptureUiState()
@@ -232,6 +278,10 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                     },
                     onOpenHelp = { showCoach = true },
                     onToggleDebug = { uiState.toggleLiveMeshDebug() },
+                    onDirectedToggle = ::onDirectedToggle,
+                    onDirectedSnap = ::onDirectedSnap,
+                    onDirectedBuild = ::onDirectedBuild,
+                    onDirectedView = ::onDirectedView,
                 )
                 CoachOverlay(
                     visible = showCoach,
@@ -355,20 +405,117 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             showMessage(getString(R.string.turntable_unavailable))
             return
         }
+        // Leaving directed capture: end any active session cleanly.
+        if (uiState.captureMode == CaptureMode.Directed && mode != CaptureMode.Directed) {
+            directedActive = false
+            runOnUiThread { uiState.onDirectedActive(false) }
+        }
         uiState.selectCaptureMode(mode)
-        // Live mesh runs whenever its mode is selected (independent of the recorder), so
-        // start a fresh reconstruction on entry and pause it when leaving.
-        if (mode == CaptureMode.LiveMesh) {
-            lastLiveMeshVersion = -1
-            liveReconstructor?.reset()
-            liveReconstructor?.start()
-            // Surface the active depth backend right away (the per-frame stats only update once
-            // ARCore is TRACKING, so without this the chip shows the ARCore default until then).
-            liveReconstructor?.let { uiState.onLiveMeshStats(0, 0, it.depthBackend) }
-        } else {
-            // Leaving live mesh: persist whatever was reconstructed before pausing fusion.
-            exportLiveMeshIfAny()
-            liveReconstructor?.stop()
+        when (mode) {
+            // Live mesh runs whenever its mode is selected (independent of the recorder), so
+            // start a fresh reconstruction on entry and pause it when leaving.
+            CaptureMode.LiveMesh -> {
+                lastLiveMeshVersion = -1
+                liveReconstructor?.reset()
+                liveReconstructor?.start()
+                // Surface the active depth backend right away (the per-frame stats only update once
+                // ARCore is TRACKING, so without this the chip shows the ARCore default until then).
+                liveReconstructor?.let { uiState.onLiveMeshStats(0, 0, it.depthBackend) }
+            }
+            // Directed capture doesn't run live fusion; it collects keyframes and builds at the end.
+            CaptureMode.Directed -> {
+                exportLiveMeshIfAny()
+                liveReconstructor?.stop()
+                resetDirected()
+            }
+            else -> {
+                exportLiveMeshIfAny()
+                liveReconstructor?.stop()
+            }
+        }
+    }
+
+    /** Clears all directed-capture state (keyframes, coverage, built mesh). */
+    private fun resetDirected() {
+        synchronized(batchFrames) { batchFrames.clear() }
+        java.util.Arrays.fill(directedSectors, false)
+        dirCentroidSumX = 0f; dirCentroidSumY = 0f; dirCentroidSumZ = 0f; dirCentroidSamples = 0
+        dirHasLastCam = false
+        dirLastCaptureNs = 0L
+        directedMesh = null
+        lastDirectedMeshDrawn = -1
+        directedSnapRequested = false
+        maskOverlayRenderer.clear()
+        runOnUiThread { uiState.onDirectedCaptured(0) }
+    }
+
+    /** Start/stop the directed-capture session (Start/Done button). */
+    private fun onDirectedToggle() {
+        if (directedBuilding) return
+        directedActive = !directedActive
+        val active = directedActive
+        if (!active) maskOverlayRenderer.clear()
+        runOnUiThread { uiState.onDirectedActive(active) }
+    }
+
+    /** Manual shutter for directed capture: grab the next GL frame regardless of the auto-fire gate. */
+    private fun onDirectedSnap() {
+        if (directedActive && !directedBuilding) directedSnapRequested = true
+    }
+
+    /** Re-open the orbitable viewer on the most recently built directed-capture cloud. */
+    private fun onDirectedView() {
+        val path = directedModelPath ?: return
+        startActivity(ModelViewerActivity.intent(this, path))
+    }
+
+    /**
+     * End-of-capture build: replay the captured keyframes through [BatchReconstructor] (DA3 + SAM +
+     * one global scale + TSDF) on a worker, write the OBJ, and show the result mesh in AR.
+     */
+    private fun onDirectedBuild() {
+        if (directedBuilding) return
+        val frames = synchronized(batchFrames) { ArrayList(batchFrames) }
+        if (frames.size < MIN_DIRECTED_FRAMES) {
+            showMessage(getString(R.string.directed_need_more))
+            return
+        }
+        val recon = liveReconstructor?.newBatchReconstructor() ?: return
+        directedActive = false
+        directedBuilding = true
+        maskOverlayRenderer.clear()
+        runOnUiThread {
+            uiState.onDirectedActive(false)
+            uiState.onDirectedBuilding(true, "")
+        }
+        batchWorker.execute {
+            val mesh = try {
+                recon.reconstruct(frames) { done, total, label ->
+                    runOnUiThread { uiState.onDirectedBuilding(true, label) }
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "directed build failed", t)
+                MeshData.EMPTY
+            }
+            directedBuilding = false
+            if (mesh.isEmpty) {
+                runOnUiThread {
+                    uiState.onDirectedMeshBuilt(0)
+                    showMessage(getString(R.string.directed_failed))
+                }
+            } else {
+                val file = File(File(getExternalFilesDir(null), "models"), "model_${STAMP.format(Date())}.obj")
+                MeshExport.writeObj(mesh, file)
+                directedMesh = mesh
+                directedMeshVersion++
+                directedModelPath = file.absolutePath
+                runOnUiThread {
+                    uiState.onDirectedMeshBuilt(mesh.vertexCount)
+                    showMessage(getString(R.string.directed_done, mesh.vertexCount))
+                    // Jump straight into the orbitable cloud viewer so the result is immediately visible.
+                    startActivity(ModelViewerActivity.intent(this, file.absolutePath))
+                }
+            }
         }
     }
 
@@ -398,9 +545,9 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 ?: OpenCvBoardDetector(boardSpec).also { boardDetector = it }
             TurntablePoseProvider(boardSpec, detector)
         }
-        // Live mesh doesn't use the recorder's pose provider for its reconstruction, but
-        // recording in this mode (if started) should behave like a free orbit.
-        CaptureMode.Orbit, CaptureMode.LiveMesh -> OrbitPoseProvider()
+        // Live mesh / directed capture don't use the recorder's pose provider for reconstruction,
+        // but recording in these modes (if started) should behave like a free orbit.
+        CaptureMode.Orbit, CaptureMode.LiveMesh, CaptureMode.Directed -> OrbitPoseProvider()
     }
 
     /**
@@ -662,12 +809,15 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         backgroundRenderer.createOnGlThread()
+        maskOverlayRenderer.createOnGlThread()
         meshRenderer.createOnGlThread()
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
         displayRotationHelper.onSurfaceChanged(width, height)
         GLES20.glViewport(0, 0, width, height)
+        surfaceW = width
+        surfaceH = height
     }
 
     override fun onDrawFrame(gl: GL10?) {
@@ -681,6 +831,8 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             session.setCameraTextureName(backgroundRenderer.textureId)
             val frame = session.update()
             backgroundRenderer.draw(frame)
+            // Live segmentation tint (Guided mode); aligned to the camera via ARCore's transform.
+            maskOverlayRenderer.draw(frame)
             // Recording gates on camera translation; acquires/copies happen here on
             // the GL thread, encoding + disk I/O are offloaded inside the recorder.
             frameRecorder.onFrame(frame)
@@ -693,6 +845,9 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             // Board-free live mesh: fuse depth into the TSDF and draw the growing mesh
             // over the camera feed (only in LiveMesh capture mode).
             updateLiveMesh(frame)
+            // Directed capture: coverage-guided keyframe collection + built-mesh AR overlay
+            // (only in Directed capture mode).
+            updateDirected(frame)
         } catch (t: Throwable) {
             // Never let an exception escape the GL thread.
             Log.e(TAG, "Exception on the GL thread", t)
@@ -764,6 +919,193 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
                 val text = (dbg?.text ?: "no keyframe processed yet") + "\ntracking=$track"
                 runOnUiThread { uiState.onLiveMeshDebug(bmp, text) }
             }
+        }
+    }
+
+    /**
+     * Directed-capture hook (GL thread). In [CaptureMode.Directed], tracks the camera's azimuth
+     * around the object and auto-fires a keyframe when it reaches an uncovered angle and holds
+     * steady (manual Snap forces one), updating the coverage ring. After a build it draws the
+     * resulting mesh in AR over the object. No live fusion runs here — frames are buffered for the
+     * end-of-capture [onDirectedBuild] pass.
+     */
+    private fun updateDirected(frame: com.google.ar.core.Frame) {
+        if (uiState.captureMode != CaptureMode.Directed) return
+        val camera = frame.camera
+        if (camera.trackingState != TrackingState.TRACKING) return
+
+        if (directedActive && !directedBuilding) {
+            val pose = FloatArray(16)
+            camera.pose.toMatrix(pose, 0)
+            val camX = camera.pose.tx()
+            val camY = camera.pose.ty()
+            val camZ = camera.pose.tz()
+
+            // Object centroid = camera + forward(-Z) * center depth, averaged across frames (the
+            // object is stationary, so this converges on its world center).
+            val centerDepth = estimateCenterDepthMeters(frame)
+            if (centerDepth != null && centerDepth > 0f) {
+                val z = camera.pose.zAxis
+                dirCentroidSumX += camX - z[0] * centerDepth
+                dirCentroidSumY += camY - z[1] * centerDepth
+                dirCentroidSumZ += camZ - z[2] * centerDepth
+                dirCentroidSamples++
+            }
+
+            // Steadiness: how far the camera moved since the previous frame.
+            val moved = if (dirHasLastCam) {
+                val dx = camX - dirLastCamX
+                val dy = camY - dirLastCamY
+                val dz = camZ - dirLastCamZ
+                sqrt(dx * dx + dy * dy + dz * dz)
+            } else {
+                Float.MAX_VALUE
+            }
+            dirLastCamX = camX; dirLastCamY = camY; dirLastCamZ = camZ; dirHasLastCam = true
+            val steady = moved < DIRECTED_STEADY_M
+
+            // Current azimuth sector of the camera around the object centroid.
+            var sector = -1
+            if (dirCentroidSamples >= DIRECTED_MIN_CENTROID) {
+                val cX = dirCentroidSumX / dirCentroidSamples
+                val cZ = dirCentroidSumZ / dirCentroidSamples
+                val dx = camX - cX
+                val dz = camZ - cZ
+                if (dx * dx + dz * dz > 1e-6f) {
+                    var az = atan2(dx, dz)
+                    if (az < 0f) az += (2.0 * Math.PI).toFloat()
+                    sector = ((az / (2.0 * Math.PI).toFloat()) * CaptureUiState.AZIMUTH_SECTORS).toInt()
+                        .coerceIn(0, CaptureUiState.AZIMUTH_SECTORS - 1)
+                }
+            }
+
+            val now = System.nanoTime()
+            val intervalOk = (now - dirLastCaptureNs) > DIRECTED_MIN_INTERVAL_NS
+            // Auto-fire at a fresh angle when holding steady; manual Snap overrides every gate.
+            val fire = directedSnapRequested ||
+                (steady && intervalOk && sector >= 0 && !directedSectors[sector])
+            if (fire) {
+                if (captureDirected(frame, camera, pose)) {
+                    if (sector >= 0) directedSectors[sector] = true
+                    directedSnapRequested = false
+                }
+            } else {
+                // Not capturing this frame: run a throttled FastSAM preview so the user sees the live
+                // mask. Mutually exclusive with capture so we never acquire the camera image twice.
+                maybeDirectedPreview(frame)
+            }
+
+            // Feed the live coverage ring (throttled), showing the current sector even before a shot.
+            val nowMs = SystemClock.elapsedRealtime()
+            if (nowMs - dirLastRingMs > 100L) {
+                dirLastRingMs = nowMs
+                var mask = 0
+                var covered = 0
+                for (i in directedSectors.indices) {
+                    if (directedSectors[i]) { mask = mask or (1 shl i); covered++ }
+                }
+                val pct = covered * 100 / CaptureUiState.AZIMUTH_SECTORS
+                val cur = sector
+                runOnUiThread { uiState.onObjectCoverage(mask, cur, pct, tracking = true) }
+            }
+        }
+
+        // Show the built model in AR (world-space, drawn with the live camera view/projection).
+        val mesh = directedMesh ?: return
+        if (lastDirectedMeshDrawn != directedMeshVersion) {
+            meshRenderer.updateMesh(mesh, directedMeshVersion)
+            lastDirectedMeshDrawn = directedMeshVersion
+        }
+        camera.getViewMatrix(liveViewMatrix, 0)
+        camera.getProjectionMatrix(liveProjMatrix, 0, 0.05f, 10f)
+        Matrix.multiplyMM(liveMvpMatrix, 0, liveProjMatrix, 0, liveViewMatrix, 0)
+        meshRenderer.draw(liveMvpMatrix)
+    }
+
+    /**
+     * Throttled live-segmentation preview for Guided mode: acquires the camera image on the GL thread
+     * and runs FastSAM on [previewWorker], pushing a small camera+mask thumbnail to the UI so the user
+     * can see what's being locked onto. No-op if a preview is already in flight or no segmenter loaded.
+     */
+    private fun maybeDirectedPreview(frame: com.google.ar.core.Frame) {
+        if (liveReconstructor?.segActive != true) return
+        val nowMs = SystemClock.elapsedRealtime()
+        if (nowMs - dirLastPreviewMs < DIRECTED_PREVIEW_MS) return
+        if (!previewBusy.compareAndSet(false, true)) return
+        dirLastPreviewMs = nowMs
+        val argb = try {
+            frame.acquireCameraImage().use { ImageUtils.yuvToArgb(it) }
+        } catch (e: Exception) {
+            null
+        }
+        if (argb == null) {
+            previewBusy.set(false)
+            return
+        }
+        previewWorker.execute {
+            try {
+                val mask = liveReconstructor?.inferPreviewMask(argb, MASK_W, MASK_H)
+                if (mask != null) {
+                    maskOverlayRenderer.setMask(mask, MASK_W, MASK_H)
+                } else {
+                    maskOverlayRenderer.clear()
+                }
+                var on = 0
+                if (mask != null) for (v in mask) if (v > 0.5f) on++
+                val coverage = if (mask != null) on.toFloat() / mask.size else 0f
+                val found = mask != null && on > 0
+                runOnUiThread { uiState.onDirectedPreview(null, found, coverage) }
+            } catch (t: Throwable) {
+                Log.w(TAG, "directed preview failed", t)
+            } finally {
+                previewBusy.set(false)
+            }
+        }
+    }
+
+    /**
+     * Acquires a directed-capture keyframe from the current frame (full-res color + ARCore raw depth
+     * + confidence + pose + intrinsics) into [batchFrames]. Must run on the GL thread while [frame]
+     * is current. Returns true on success.
+     */
+    private fun captureDirected(
+        frame: com.google.ar.core.Frame,
+        camera: com.google.ar.core.Camera,
+        poseColumnMajor: FloatArray,
+    ): Boolean {
+        return try {
+            val depthMap = frame.acquireRawDepthImage16Bits().use { ImageUtils.depth16ToMeters(it) }
+            val conf = try {
+                frame.acquireRawDepthConfidenceImage().use { ImageUtils.confidence8ToFloat(it) }
+            } catch (e: Exception) {
+                null
+            }
+            val depth = if (conf != null && conf.size == depthMap.width * depthMap.height) {
+                DepthMap(depthMap.width, depthMap.height, depthMap.depthMeters, conf)
+            } else {
+                depthMap
+            }
+            val argb = frame.acquireCameraImage().use { ImageUtils.yuvToArgb(it) }
+            val intr = camera.imageIntrinsics
+            val intrinsics = CameraIntrinsics(
+                fx = intr.focalLength[0],
+                fy = intr.focalLength[1],
+                cx = intr.principalPoint[0],
+                cy = intr.principalPoint[1],
+                width = intr.imageDimensions[0],
+                height = intr.imageDimensions[1],
+            )
+            val groundY = supportPlaneY(camera.pose.ty())
+            batchFrames.add(
+                BatchReconstructor.Keyframe(argb, depth, intrinsics, poseColumnMajor.copyOf(), groundY),
+            )
+            dirLastCaptureNs = System.nanoTime()
+            val n = batchFrames.size
+            runOnUiThread { uiState.onDirectedCaptured(n) }
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "directed capture failed", e)
+            false
         }
     }
 
@@ -1000,5 +1342,20 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         /** Below this vertex count the live mesh isn't a real object yet — skip the OBJ export. */
         private const val MIN_EXPORT_VERTS = 200
         private val STAMP = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
+
+        // ----- Directed capture tuning -----
+        /** Minimum keyframes before a build is allowed. */
+        private const val MIN_DIRECTED_FRAMES = 3
+        /** Per-frame camera movement (m) below which the phone counts as "steady" for auto-fire. */
+        private const val DIRECTED_STEADY_M = 0.012f
+        /** Centroid samples needed before the azimuth sector is trusted. */
+        private const val DIRECTED_MIN_CENTROID = 4
+        /** Minimum spacing between auto/manual captures (debounce). */
+        private const val DIRECTED_MIN_INTERVAL_NS = 350_000_000L
+        /** Min interval between live-segmentation preview runs (ms). */
+        private const val DIRECTED_PREVIEW_MS = 180L
+        /** FastSAM output mask size for the live overlay (maps uniformly onto the camera image). */
+        private const val MASK_W = 256
+        private const val MASK_H = 192
     }
 }

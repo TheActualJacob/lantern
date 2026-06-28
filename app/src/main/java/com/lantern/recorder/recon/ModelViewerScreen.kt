@@ -147,6 +147,79 @@ fun ModelViewerScreen(
     }
 }
 
+/**
+ * Standalone viewer for a freshly reconstructed [mesh] (e.g. a directed-capture point cloud), not
+ * tied to a recorded session. Same orbit/auto-rotate surface as [ModelViewerScreen], with stats
+ * derived straight from the mesh and an optional share action.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ModelCloudViewer(
+    mesh: MeshData?,
+    title: String,
+    onBack: () -> Unit,
+    onShare: (() -> Unit)? = null,
+) {
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text(title) },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_arrow_back),
+                            contentDescription = stringResource(R.string.action_back),
+                        )
+                    }
+                },
+            )
+        },
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding),
+        ) {
+            Wireframe3DSurface(
+                mesh = mesh,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+            )
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                OutlinedCard(shape = RoundedCornerShape(16.dp)) {
+                    Column(Modifier.padding(16.dp)) {
+                        StatRow(
+                            stringResource(R.string.model_stat_vertices),
+                            "%,d".format(mesh?.vertexCount ?: 0),
+                        )
+                        StatRow(
+                            stringResource(R.string.model_stat_dimensions),
+                            mesh?.let { formatMeshDimensions(it) } ?: "—",
+                        )
+                    }
+                }
+                if (onShare != null) {
+                    FilledTonalButton(onClick = onShare, modifier = Modifier.fillMaxWidth()) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_share),
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(Modifier.size(8.dp))
+                        Text(stringResource(R.string.model_export_glb))
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 private fun StatRow(label: String, value: String) {
     Row(

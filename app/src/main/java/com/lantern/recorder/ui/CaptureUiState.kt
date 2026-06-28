@@ -48,6 +48,14 @@ enum class CaptureMode {
      * cubes). See `com.lantern.recorder.recon.LiveReconstructor`.
      */
     LiveMesh,
+
+    /**
+     * **Directed capture**: instead of continuous video, deliberately capture a handful of
+     * well-framed keyframes around the object (a coverage ring guides you, auto-firing when you
+     * reach a needed angle; manual snap always available), then tap Build to run one
+     * reconstruction pass. See `com.lantern.recorder.recon.BatchReconstructor`.
+     */
+    Directed,
 }
 
 /**
@@ -223,6 +231,67 @@ class CaptureUiState {
     fun onLiveMeshDebug(bmp: android.graphics.Bitmap?, text: String) {
         liveMeshDebugBitmap = bmp
         liveMeshDebugText = text
+    }
+
+    // ----- Directed capture (deliberate keyframes -> build at end) -----
+
+    /** Whether a directed-capture session is actively collecting keyframes. */
+    var directedActive by mutableStateOf(false)
+        private set
+
+    /** Keyframes captured in the current directed session. */
+    var directedCount by mutableIntStateOf(0)
+        private set
+
+    /** Whether the end-of-capture build (DA3 + fusion) is running. */
+    var directedBuilding by mutableStateOf(false)
+        private set
+
+    /** Human-readable build progress (e.g. "Fusing 7/12"). */
+    var directedProgress by mutableStateOf("")
+        private set
+
+    /** Vertices in the most recently built directed-capture mesh (0 until one is built). */
+    var directedMeshVertices by mutableIntStateOf(0)
+        private set
+
+    /** Live FastSAM preview while capturing: a small camera+mask thumbnail and whether an object is found. */
+    var directedPreviewBitmap by mutableStateOf<android.graphics.Bitmap?>(null)
+        private set
+    var directedObjectFound by mutableStateOf(false)
+        private set
+    var directedMaskCoverage by mutableStateOf(0f)
+        private set
+
+    fun onDirectedPreview(bitmap: android.graphics.Bitmap?, found: Boolean, coverage: Float) {
+        directedPreviewBitmap = bitmap
+        directedObjectFound = found
+        directedMaskCoverage = coverage
+    }
+
+    fun onDirectedActive(active: Boolean) {
+        directedActive = active
+        if (active) {
+            resetCoverage()
+        } else {
+            directedPreviewBitmap = null
+            directedObjectFound = false
+        }
+    }
+
+    fun onDirectedCaptured(count: Int) {
+        directedCount = count
+    }
+
+    fun onDirectedBuilding(building: Boolean, progress: String = "") {
+        directedBuilding = building
+        directedProgress = progress
+    }
+
+    fun onDirectedMeshBuilt(vertices: Int) {
+        directedMeshVertices = vertices
+        directedBuilding = false
+        directedProgress = ""
     }
 
     fun onDepthResolved(supported: Boolean) {

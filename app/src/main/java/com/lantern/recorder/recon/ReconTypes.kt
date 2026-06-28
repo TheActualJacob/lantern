@@ -67,7 +67,12 @@ class MeshData(
 ) {
     val vertexCount: Int get() = vertices.size / 3
     val triangleCount: Int get() = indices.size / 3
-    val isEmpty: Boolean get() = indices.isEmpty()
+
+    /** No geometry at all (used to signal a failed/blank reconstruction). */
+    val isEmpty: Boolean get() = vertices.isEmpty()
+
+    /** Vertices but no triangles: render as a point cloud (GL_POINTS) instead of a surface. */
+    val isPointCloud: Boolean get() = indices.isEmpty() && vertices.isNotEmpty()
 
     companion object {
         val EMPTY = MeshData(FloatArray(0), FloatArray(0), IntArray(0))

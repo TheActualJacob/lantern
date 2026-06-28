@@ -60,6 +60,40 @@ object AffineScaleSolver {
     }
 
     /**
+     * Fit a robust affine `(s, t)` *candidate* for this frame (DA3 disparity vs ARCore metric depth),
+     * with the same mask -> focus-band -> full-frame fallback chain as [buildMetricDepth] but without
+     * building a depth map. Feed the result to [DepthScaleTracker] to obtain a stable global scale;
+     * returns null if too few overlapping samples exist to fit.
+     */
+    fun fitAffine(
+        disp: DisparityMap,
+        metric: DepthMap,
+        confThreshold: Float = 0.5f,
+        focusDepthM: Float? = null,
+        mask: FloatArray? = null,
+    ): Affine? {
+        val dispAtMetric = resizeNearest(disp, metric.width, metric.height)
+        return solve(dispAtMetric, metric, confThreshold, focusDepthM, mask)
+            ?: solve(dispAtMetric, metric, confThreshold, focusDepthM, null)
+            ?: solve(dispAtMetric, metric, confThreshold, null, null)
+    }
+
+    /**
+     * Apply a **fixed** affine `(s, t)` to DA3 disparity, producing a dense metric depth map (meters,
+     * 0 = invalid) at [w]x[h]. Unlike [buildMetricDepth], no ARCore depth *values* enter the geometry
+     * here — the scale is supplied externally (a locked global scale), so the surface is pure DA3.
+     */
+    fun applyAffine(disp: DisparityMap, w: Int, h: Int, affine: Affine): DepthMap {
+        val dispAtMetric = resizeNearest(disp, w, h)
+        val out = FloatArray(w * h)
+        for (i in out.indices) {
+            val md = affine.s * dispAtMetric[i] + affine.t
+            out[i] = if (md > 1e-4f && md.isFinite()) 1f / md else 0f
+        }
+        return DepthMap(w, h, out)
+    }
+
+    /**
      * Fit (s, t) over confident, valid, overlapping samples. Null if too few.
      * If [focusDepthM] is given, only samples whose metric depth is within [FOCUS_BAND] of it are
      * used, so the fit tracks the object rather than the background.

@@ -53,6 +53,14 @@
             android:parentActivityName=".MainActivity"
             android:theme="@style/Theme.Lantern" />
 
+        <!-- Standalone 3D viewer for a just-built model (directed-capture point cloud). -->
+        <activity
+            android:name=".ModelViewerActivity"
+            android:exported="false"
+            android:label="@string/model_viewer_title"
+            android:parentActivityName=".MainActivity"
+            android:theme="@style/Theme.Lantern" />
+
         <!-- Shares zipped sessions without exposing app-private file paths. -->
         <provider
             android:name="androidx.core.content.FileProvider"

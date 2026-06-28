@@ -26,16 +26,22 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -97,6 +103,10 @@ fun CaptureOverlay(
     onOpenSessions: () -> Unit,
     onOpenHelp: () -> Unit,
     onToggleDebug: () -> Unit = {},
+    onDirectedToggle: () -> Unit = {},
+    onDirectedSnap: () -> Unit = {},
+    onDirectedBuild: () -> Unit = {},
+    onDirectedView: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     Box(modifier = modifier.fillMaxSize()) {
@@ -141,9 +151,10 @@ fun CaptureOverlay(
             )
         }
 
-        // Live pose-based coverage dome, bottom-end, while a session is recording.
+        // Live pose-based coverage dome, bottom-end, while a session is recording OR while a
+        // directed-capture session is collecting keyframes (the ring guides the orbit either way).
         CoverageGizmo(
-            visible = state.isRecording,
+            visible = state.isRecording || (state.captureMode == CaptureMode.Directed && state.directedActive),
             bandMaskSides = state.bandMaskSides,
             bandMaskUpper = state.bandMaskUpper,
             topCovered = state.topCovered,
@@ -181,22 +192,77 @@ fun CaptureOverlay(
             }
         }
 
-        // The shutter is blocked mid-flip (object being handled); in ReadyForPassTwo it
-        // invites the user to start the second side.
-        val flipBlocked = state.scanPhase == ScanPhase.NeedsFlip ||
-            state.scanPhase == ScanPhase.Flipping
-        val startPassTwo = state.scanPhase == ScanPhase.ReadyForPassTwo
-        ShutterButton(
-            recording = state.isRecording,
-            enabled = state.depthSupported && !flipBlocked,
-            frameCount = state.frameCount,
-            startPassTwo = startPassTwo,
-            onClick = onToggleRecord,
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .windowInsetsPadding(WindowInsets.navigationBars)
-                .padding(bottom = 32.dp),
-        )
+        // The segmented object is tinted green directly on the camera feed by MaskOverlayRenderer (GL,
+        // aligned via ARCore). Here we add a lock-status pill so the user knows it's tracking.
+        if (state.captureMode == CaptureMode.Directed && state.directedActive) {
+            Surface(
+                color = Color.Black.copy(alpha = 0.55f),
+                contentColor = Color.White,
+                shape = RoundedCornerShape(50),
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .windowInsetsPadding(WindowInsets.statusBars)
+                    .padding(top = 12.dp),
+            ) {
+                Text(
+                    text = if (state.directedObjectFound) {
+                        stringResource(R.string.directed_object_locked, (state.directedMaskCoverage * 100).toInt())
+                    } else {
+                        stringResource(R.string.directed_object_searching)
+                    },
+                    style = MaterialTheme.typography.labelLarge,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                )
+            }
+        }
+
+        // Bottom-center controls depend on the mode: directed capture has its own start/snap/build
+        // controls; every other mode uses the classic shutter.
+        if (state.captureMode == CaptureMode.Directed) {
+            DirectedControls(
+                state = state,
+                onToggle = onDirectedToggle,
+                onSnap = onDirectedSnap,
+                onBuild = onDirectedBuild,
+                onView = onDirectedView,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .windowInsetsPadding(WindowInsets.navigationBars)
+                    .padding(bottom = 32.dp),
+            )
+        } else {
+            // The shutter is blocked mid-flip (object being handled); in ReadyForPassTwo it
+            // invites the user to start the second side.
+            val flipBlocked = state.scanPhase == ScanPhase.NeedsFlip ||
+                state.scanPhase == ScanPhase.Flipping
+            val startPassTwo = state.scanPhase == ScanPhase.ReadyForPassTwo
+            ShutterButton(
+                recording = state.isRecording,
+                enabled = state.depthSupported && !flipBlocked,
+                frameCount = state.frameCount,
+                startPassTwo = startPassTwo,
+                onClick = onToggleRecord,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .windowInsetsPadding(WindowInsets.navigationBars)
+                    .padding(bottom = 32.dp),
+            )
+        }
+
+        // Mode switch (Live Mesh <-> Guided), bottom-center just above the controls. Hidden while a
+        // directed session is active or building so it can't be toggled mid-capture.
+        if (!(state.captureMode == CaptureMode.Directed && (state.directedActive || state.directedBuilding)) &&
+            !state.isRecording
+        ) {
+            ModeSwitch(
+                mode = state.captureMode,
+                onSelect = onSetCaptureMode,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .windowInsetsPadding(WindowInsets.navigationBars)
+                    .padding(bottom = 132.dp),
+            )
+        }
 
         // Transient "saved" confirmation, floating just above the shutter. Far nicer
         // than a system toast: on-brand, auto-dismissing, with a direct "View" action.
@@ -212,6 +278,197 @@ fun CaptureOverlay(
                 .windowInsetsPadding(WindowInsets.navigationBars)
                 .padding(bottom = 140.dp, start = 24.dp, end = 24.dp),
         )
+    }
+}
+
+/**
+ * A compact two-option switch between Live Mesh and Guided (directed) capture, so the user can
+ * pick the workflow. Pill row, selected option highlighted.
+ */
+@Composable
+private fun ModeSwitch(
+    mode: CaptureMode,
+    onSelect: (CaptureMode) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        color = Color.Black.copy(alpha = 0.4f),
+        shape = RoundedCornerShape(22.dp),
+        modifier = modifier,
+    ) {
+        Row(modifier = Modifier.padding(4.dp)) {
+            ModePill(
+                label = stringResource(R.string.mode_livemesh),
+                selected = mode == CaptureMode.LiveMesh,
+                onClick = { onSelect(CaptureMode.LiveMesh) },
+            )
+            ModePill(
+                label = stringResource(R.string.mode_directed),
+                selected = mode == CaptureMode.Directed,
+                onClick = { onSelect(CaptureMode.Directed) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun ModePill(label: String, selected: Boolean, onClick: () -> Unit) {
+    Surface(
+        color = if (selected) Color.White else Color.Transparent,
+        contentColor = if (selected) LanternNavy else Color.White,
+        shape = RoundedCornerShape(18.dp),
+        modifier = Modifier
+            .clip(RoundedCornerShape(18.dp))
+            .clickable(role = Role.Button, onClick = onClick),
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(horizontal = 18.dp, vertical = 8.dp),
+        )
+    }
+}
+
+/**
+ * Directed-capture controls: a Start/Done toggle, a manual Snap, and (after capturing) a Build
+ * button, plus a shot count, contextual hint, and a build-progress card. Mirrors the hybrid
+ * capture flow (auto-fire while orbiting + manual snap + build at end).
+ */
+@Composable
+private fun DirectedControls(
+    state: CaptureUiState,
+    onToggle: () -> Unit,
+    onSnap: () -> Unit,
+    onBuild: () -> Unit,
+    onView: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = modifier.widthIn(max = 460.dp).padding(horizontal = 24.dp),
+    ) {
+        if (state.directedBuilding) {
+            Surface(
+                color = LanternNavy.copy(alpha = 0.94f),
+                contentColor = Color.White,
+                shape = RoundedCornerShape(20.dp),
+                shadowElevation = 8.dp,
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 14.dp),
+                ) {
+                    CircularProgressIndicator(
+                        color = Color(0xFF8FC9FF),
+                        strokeWidth = 3.dp,
+                        modifier = Modifier.size(22.dp),
+                    )
+                    Text(
+                        text = stringResource(R.string.directed_building, state.directedProgress),
+                        style = MaterialTheme.typography.titleSmall,
+                        modifier = Modifier.padding(start = 14.dp),
+                    )
+                }
+            }
+            return@Column
+        }
+
+        // Hint + count line.
+        Text(
+            text = if (state.directedActive) {
+                stringResource(R.string.directed_count, state.directedCount)
+            } else {
+                stringResource(R.string.directed_hint)
+            },
+            style = MaterialTheme.typography.bodyMedium,
+            color = Color.White,
+            textAlign = TextAlign.Center,
+            modifier = Modifier
+                .clip(RoundedCornerShape(12.dp))
+                .drawBehind { drawRect(Color.Black.copy(alpha = 0.35f)) }
+                .padding(horizontal = 14.dp, vertical = 6.dp),
+        )
+
+        Spacer(Modifier.height(14.dp))
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (state.directedActive) {
+                // Snap (manual capture) + Done.
+                Button(
+                    onClick = onSnap,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color.White,
+                        contentColor = LanternNavy,
+                    ),
+                    shape = RoundedCornerShape(24.dp),
+                ) {
+                    Text(stringResource(R.string.directed_snap), fontWeight = FontWeight.SemiBold)
+                }
+                Spacer(Modifier.width(14.dp))
+                Button(
+                    onClick = onToggle,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = RecordRed,
+                        contentColor = Color.White,
+                    ),
+                    shape = RoundedCornerShape(24.dp),
+                ) {
+                    Text(stringResource(R.string.directed_stop), fontWeight = FontWeight.SemiBold)
+                }
+            } else if (state.directedCount > 0) {
+                // Re-open capture or build what we have.
+                Button(
+                    onClick = onToggle,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color.White.copy(alpha = 0.18f),
+                        contentColor = Color.White,
+                    ),
+                    shape = RoundedCornerShape(24.dp),
+                ) {
+                    Text(stringResource(R.string.directed_start), fontWeight = FontWeight.SemiBold)
+                }
+                Spacer(Modifier.width(14.dp))
+                Button(
+                    onClick = onBuild,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF34C759),
+                        contentColor = Color.White,
+                    ),
+                    shape = RoundedCornerShape(24.dp),
+                ) {
+                    Text(
+                        stringResource(R.string.directed_build, state.directedCount),
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+                if (state.directedMeshVertices > 0) {
+                    Spacer(Modifier.width(14.dp))
+                    Button(
+                        onClick = onView,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color.White.copy(alpha = 0.18f),
+                            contentColor = Color.White,
+                        ),
+                        shape = RoundedCornerShape(24.dp),
+                    ) {
+                        Text(stringResource(R.string.directed_view), fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            } else {
+                Button(
+                    onClick = onToggle,
+                    enabled = state.depthSupported,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color.White,
+                        contentColor = LanternNavy,
+                    ),
+                    shape = RoundedCornerShape(24.dp),
+                ) {
+                    Text(stringResource(R.string.directed_start), fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
     }
 }
 

@@ -83,6 +83,22 @@
     <string name="livemesh_backend_qnn">QNN NPU</string>
     <string name="livemesh_backend_da3">DA3 CPU</string>
     <string name="livemesh_backend_arcore">ARCore depth</string>
+    <!-- Directed capture (deliberate keyframes -> build at end). -->
+    <string name="mode_directed">Guided</string>
+    <string name="mode_directed_cd">Guided capture: take a few deliberate shots around the object, then build the model</string>
+    <string name="directed_start">Start guided capture</string>
+    <string name="directed_stop">Done capturing</string>
+    <string name="directed_snap">Snap</string>
+    <string name="directed_count">%1$d shots captured</string>
+    <string name="directed_build">Build model (%1$d shots)</string>
+    <string name="directed_need_more">Capture a few more angles first</string>
+    <string name="directed_building">Building model… %1$s</string>
+    <string name="directed_done">Model built: %1$d verts</string>
+    <string name="directed_failed">Build produced no mesh — try capturing more angles</string>
+    <string name="directed_hint">Orbit slowly; a shot auto-fires at each new angle. Tap Snap to force one.</string>
+    <string name="directed_object_locked">Object locked · %1$d%% in frame</string>
+    <string name="directed_object_searching">Point at the object to lock on</string>
+    <string name="directed_view">View 3D</string>
     <string name="board_locked">Board locked — spin the object</string>
     <string name="board_searching">Point the camera at the board</string>
     <string name="turntable_hint">Put the object on the board and rotate it slowly</string>

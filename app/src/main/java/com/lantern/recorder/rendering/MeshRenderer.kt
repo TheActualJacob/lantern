@@ -24,6 +24,7 @@ class MeshRenderer {
     private var normalBuffer: FloatBuffer? = null
     private var vertexCount = 0
     private var uploadedVersion = -1
+    private var pointCloud = false
 
     fun createOnGlThread() {
         program = ShaderUtil.createProgram(VERTEX_SHADER, FRAGMENT_SHADER)
@@ -38,13 +39,20 @@ class MeshRenderer {
         if (version == uploadedVersion) return
         uploadedVersion = version
         vertexCount = mesh.vertexCount
+        pointCloud = mesh.isPointCloud
         if (mesh.isEmpty) {
             vertexBuffer = null
             normalBuffer = null
             return
         }
         vertexBuffer = newFloatBuffer(mesh.vertices)
-        normalBuffer = newFloatBuffer(mesh.normals)
+        // Point clouds may ship without normals; synthesize up-normals so the shader stays happy.
+        val normals = if (mesh.normals.size == mesh.vertices.size) {
+            mesh.normals
+        } else {
+            FloatArray(mesh.vertices.size) { if (it % 3 == 1) 1f else 0f }
+        }
+        normalBuffer = newFloatBuffer(normals)
     }
 
     fun draw(mvpColumnMajor: FloatArray) {
@@ -64,7 +72,7 @@ class MeshRenderer {
         GLES20.glVertexAttribPointer(aNormal, 3, GLES20.GL_FLOAT, false, 0, nb)
 
         GLES20.glEnable(GLES20.GL_DEPTH_TEST)
-        GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, vertexCount)
+        GLES20.glDrawArrays(if (pointCloud) GLES20.GL_POINTS else GLES20.GL_TRIANGLES, 0, vertexCount)
 
         GLES20.glDisableVertexAttribArray(aPos)
         GLES20.glDisableVertexAttribArray(aNormal)
@@ -88,6 +96,7 @@ class MeshRenderer {
             void main() {
                 vNormal = aNormal;
                 gl_Position = uMvp * aPos;
+                gl_PointSize = 7.0;
             }
         """
 

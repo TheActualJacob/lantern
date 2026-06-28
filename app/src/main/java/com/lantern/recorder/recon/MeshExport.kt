@@ -106,7 +106,8 @@ object MeshExport {
                     }
                 }
             }
-            if (verts.isEmpty() || idx.isEmpty()) return null
+            // A face-less OBJ is a valid point cloud (directed-capture export), not a failure.
+            if (verts.isEmpty()) return null
             MeshData(verts.toFloatArray(), norms.toFloatArray(), idx.toIntArray())
         } catch (t: Throwable) {
             Log.e(TAG, "MeshExport: failed to read ${file.absolutePath}", t)
