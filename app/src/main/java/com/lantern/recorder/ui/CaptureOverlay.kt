@@ -604,12 +604,11 @@ private fun CoverageGizmo(
         modifier = modifier,
     ) {
         val coverageDesc = stringResource(R.string.coverage_cd, coveragePercent)
-        // Once the user has orbited the sides but hasn't looked down on it, nudge them
-        // toward the top — the dome's whole point is exposing that missing dimension.
-        val sidesDone = Integer.bitCount(bandMaskSides) >= CaptureUiState.AZIMUTH_SECTORS
+        // Orbit ring = every azimuth direction seen at ANY elevation (matches the %).
+        val orbitMask = bandMaskSides or bandMaskUpper
         val sublabel = when {
             !objectLocked -> stringResource(R.string.coverage_locating)
-            !topCovered && sidesDone -> stringResource(R.string.coverage_hint_top)
+            !topCovered && coveragePercent >= 100 -> stringResource(R.string.coverage_hint_top)
             else -> stringResource(R.string.coverage_title)
         }
         Surface(
@@ -632,45 +631,39 @@ private fun CoverageGizmo(
                 Canvas(Modifier.size(74.dp)) {
                     val center = Offset(size.width / 2f, size.height / 2f)
                     val rOuter = size.minDimension / 2f - 1.dp.toPx()
-                    val stroke = rOuter * 0.26f
-                    val gap = rOuter * 0.07f
-                    val sidesRadius = rOuter - stroke / 2f
-                    val upperRadius = sidesRadius - stroke - gap
-                    val capRadius = (upperRadius - stroke / 2f - gap).coerceAtLeast(3.dp.toPx())
+                    val stroke = rOuter * 0.30f
+                    val ringRadius = rOuter - stroke / 2f
+                    val capRadius = (ringRadius - stroke / 2f - rOuter * 0.16f)
+                        .coerceAtLeast(4.dp.toPx())
 
                     val sweep = 360f / sectors
                     val angGap = sweep * 0.2f
 
-                    // Draw one ringed band of azimuth wedges at [radius].
-                    fun drawBand(mask: Int, band: Int, radius: Float) {
-                        val boxTopLeft = Offset(center.x - radius, center.y - radius)
-                        val boxSize = Size(radius * 2f, radius * 2f)
-                        for (i in 0 until sectors) {
-                            val covered = (mask and (1 shl i)) != 0
-                            val color = when {
-                                band == currentBand && i == currentSector -> currentColor
-                                covered -> coveredColor
-                                else -> dimColor
-                            }
-                            // Sector 0 at the top (12 o'clock); advance clockwise.
-                            val start = -90f + i * sweep + angGap / 2f
-                            drawArc(
-                                color = color,
-                                startAngle = start,
-                                sweepAngle = sweep - angGap,
-                                useCenter = false,
-                                topLeft = boxTopLeft,
-                                size = boxSize,
-                                style = Stroke(width = stroke, cap = StrokeCap.Round),
-                            )
+                    // Single orbit ring: one wedge per azimuth direction, lit if that
+                    // direction was captured at any elevation (the headline metric).
+                    val boxTopLeft = Offset(center.x - ringRadius, center.y - ringRadius)
+                    val boxSize = Size(ringRadius * 2f, ringRadius * 2f)
+                    for (i in 0 until sectors) {
+                        val covered = (orbitMask and (1 shl i)) != 0
+                        val color = when {
+                            i == currentSector && currentBand != 2 -> currentColor
+                            covered -> coveredColor
+                            else -> dimColor
                         }
+                        // Sector 0 at the top (12 o'clock); advance clockwise.
+                        val start = -90f + i * sweep + angGap / 2f
+                        drawArc(
+                            color = color,
+                            startAngle = start,
+                            sweepAngle = sweep - angGap,
+                            useCenter = false,
+                            topLeft = boxTopLeft,
+                            size = boxSize,
+                            style = Stroke(width = stroke, cap = StrokeCap.Round),
+                        )
                     }
 
-                    // Outer = sides, middle = upper band.
-                    drawBand(bandMaskSides, band = 0, radius = sidesRadius)
-                    drawBand(bandMaskUpper, band = 1, radius = upperRadius)
-
-                    // Center disc = top cap.
+                    // Center disc = the top-down "looked down on it" cap.
                     val capColor = when {
                         currentBand == 2 -> currentColor
                         topCovered -> coveredColor

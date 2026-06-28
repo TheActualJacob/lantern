@@ -128,8 +128,12 @@ class CaptureUiState {
 
     // ----- Two-pass "flip the object" flow -----
 
-    /** User opt-in: capture both sides by flipping the object between two passes. */
-    var twoPassEnabled by mutableStateOf(false)
+    /**
+     * Whether to capture both sides by flipping the object between two passes. Defaults
+     * to on, since capturing the resting/bottom face is the whole reason the flow exists;
+     * users who only want a quick one-sided scan can turn it off before recording.
+     */
+    var twoPassEnabled by mutableStateOf(true)
         private set
 
     /** Current stage of the (optional) flip flow. */
