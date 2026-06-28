@@ -263,6 +263,14 @@ class BatchReconstructor(
             progress?.update(i, n, "Fusing ${i + 1}/$n")
             val dBase = i * plane
             val mask = masks[i]
+            // Reject this view's mask if it looks like a background grab rather than the object:
+            // background-sized (covers most of the frame), empty, or off-center (e.g. SAM briefly
+            // latched the monitor/desk). Such a frame's depth would smear background into the cloud,
+            // so we skip fusing it entirely — the other views still carry the object.
+            if (!maskIsObjectLike(mask, result.geom[i], res)) {
+                Log.i(TAG, "BatchReconstructor(MV): skipping view $i (mask not object-like)")
+                continue
+            }
             // Per-view confidence gate: drop the lowest [CONF_DROP_PCT] of masked pixels (edges/holes).
             val confThr = maskedConfPercentile(result.conf, dBase, mask, CONF_DROP_PCT)
             val fx = result.intrinsics[i * 9 + 0]
@@ -340,6 +348,31 @@ class BatchReconstructor(
         out[0] = ext[e + 0] * dx + ext[e + 4] * dy + ext[e + 8] * dz
         out[1] = ext[e + 1] * dx + ext[e + 5] * dy + ext[e + 9] * dz
         out[2] = ext[e + 2] * dx + ext[e + 6] * dy + ext[e + 10] * dz
+    }
+
+    /**
+     * Whether [mask] (in the res x res letterboxed grid) reads as the centered object rather than a
+     * background grab: enough but not too-many object pixels, and a centroid near the content center.
+     * Guards against SAM briefly latching the monitor/desk in one frame (the leak that smears the
+     * cloud). [geom] gives the content box so coverage is measured against the image, not the padding.
+     */
+    private fun maskIsObjectLike(mask: FloatArray, geom: Da3MultiViewModel.ViewGeom, res: Int): Boolean {
+        var on = 0
+        var sx = 0.0
+        var sy = 0.0
+        for (idx in mask.indices) {
+            if (mask[idx] < 0.5f) continue
+            on++
+            sx += idx % res
+            sy += idx / res
+        }
+        val area = (geom.newW * geom.newH).coerceAtLeast(1)
+        val cov = on.toFloat() / area
+        if (on < MV_MIN_MASK_PIX || cov > MV_MAX_MASK_FRAC) return false
+        // Centroid must sit inside the central band of the content box (object is framed centrally).
+        val cx = (sx / on - geom.padX) / geom.newW
+        val cy = (sy / on - geom.padY) / geom.newH
+        return cx in MV_CENTER_LO..MV_CENTER_HI && cy in MV_CENTER_LO..MV_CENTER_HI
     }
 
     /** The [pct]-percentile confidence over masked pixels of view at [dBase] (the drop threshold). */
@@ -462,6 +495,12 @@ class BatchReconstructor(
 
         /** Multi-view: drop the lowest this-percent of masked pixels by DA3 confidence per view. */
         private const val CONF_DROP_PCT = 20
+
+        // Multi-view per-view mask sanity gate (reject background grabs / off-center latches):
+        private const val MV_MIN_MASK_PIX = 400          // too few object pixels => empty/failed mask
+        private const val MV_MAX_MASK_FRAC = 0.65f       // covers most of the frame => background, not object
+        private const val MV_CENTER_LO = 0.12f           // centroid must lie within the central
+        private const val MV_CENTER_HI = 0.88f           // [12%,88%] band of the content box
 
         /** Density filter: min occupied cells in a point's 26-voxel neighborhood to keep it (else a
          *  stray floater). 2 kills singletons and isolated pairs while sparing silhouette edges. */

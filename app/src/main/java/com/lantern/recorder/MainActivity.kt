@@ -387,7 +387,8 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
      * resolution. Same adb-push'able external dir; returns null when absent so the build falls back
      * to the mono per-frame path.
      */
-    private fun resolveMvModelPath(): String? = resolveModelPath("da3_mv_n8_r350.pte")
+    private fun resolveMvModelPath(): String? =
+        resolveModelPath("da3_mv_n8_r504.pte") ?: resolveModelPath("da3_mv_n8_r350.pte")
 
     /**
      * Locates the Qualcomm QNN depth model for the native Hexagon-NPU backend. Prefers a
