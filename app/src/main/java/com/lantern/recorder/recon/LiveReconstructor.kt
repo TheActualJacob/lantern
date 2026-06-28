@@ -169,6 +169,11 @@ class LiveReconstructor(
             captureDebug(argb, arcoreMetric, mask, focusDepth)
         }
 
+        // Segmentation-gated capture: if the segmenter is active but found no object at the screen
+        // center this frame, fuse nothing — otherwise the whole scene (floor) would be integrated
+        // ungated and stick in the volume. Only frames with an object mask contribute.
+        if (seg != null && mask == null) return
+
         // Prefer DA3 dense metric depth (scaled vs ARCore) when available.
         var fusionDepth = arcoreMetric
         if (argb != null && depth != null) {
