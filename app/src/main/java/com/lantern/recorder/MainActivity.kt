@@ -169,7 +169,8 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         // mesh from ARCore raw depth alone. We check the external files dir first since it's
         // directly `adb push`-able (/sdcard/Android/data/<pkg>/files/), then internal.
         val da3ModelPath = resolveDa3ModelPath()
-        liveReconstructor = LiveReconstructor(da3ModelPath)
+        val qnnModelPath = resolveQnnModelPath()
+        liveReconstructor = LiveReconstructor(da3ModelPath, qnnModelPath)
 
         frameRecorder = FrameRecorder(this)
         frameRecorder.onFrameSaved = { index, sessionName ->
@@ -303,6 +304,22 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
         val internal = File(filesDir, name)
         if (internal.exists()) return internal.absolutePath
         return (external ?: internal).absolutePath
+    }
+
+    /**
+     * Locates the Qualcomm QNN depth model for the native Hexagon-NPU backend. Prefers a
+     * pre-compiled HTP **context binary** (`da3_qnn_v79.bin` — fastest init) and falls back to
+     * the raw AI Hub `depth_anything_v3.dlc` (prepared on device). Same `adb push`-able external
+     * dir as the `.pte`. Returns null when neither is present (no QNN model shipped on this
+     * build) so [LiveReconstructor] uses ExecuTorch/ARCore instead.
+     */
+    private fun resolveQnnModelPath(): String? {
+        val candidates = listOf("da3_qnn_v79.bin", "depth_anything_v3.dlc")
+        for (name in candidates) {
+            getExternalFilesDir(null)?.let { File(it, name) }?.let { if (it.exists()) return it.absolutePath }
+            File(filesDir, name).let { if (it.exists()) return it.absolutePath }
+        }
+        return null
     }
 
     /** Switches capture mode from the overlay toggle (idle only; turntable needs OpenCV). */
@@ -660,8 +677,8 @@ class MainActivity : AppCompatActivity(), GLSurfaceView.Renderer {
             lastLiveStatsMs = now
             val vertices = recon.latestMesh().vertexCount
             val frames = recon.frameCount
-            val da3 = recon.da3Active
-            runOnUiThread { uiState.onLiveMeshStats(vertices, frames, da3) }
+            val backend = recon.depthBackend
+            runOnUiThread { uiState.onLiveMeshStats(vertices, frames, backend) }
         }
     }
 

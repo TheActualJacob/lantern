@@ -4,6 +4,16 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+// QNN Hexagon-NPU depth backend (recon/QnnDlcDepthModel.kt + cpp/qnn_depth.cpp) is opt-in: it
+// requires the Qualcomm QAIRT/QNN SDK (for headers) plus the NDK/CMake. Enable by passing
+// `-Pqnn.sdkRoot=/path/to/qairt/2.45.x` or setting the QNN_SDK_ROOT env var. When unset, the
+// native build is skipped entirely so the stock (headless) build needs no NDK, and the app
+// degrades to ExecuTorch/ARCore depth at runtime.
+val qnnSdkRoot: String? =
+    (project.findProperty("qnn.sdkRoot") as String?)?.takeIf { it.isNotBlank() }
+        ?: System.getenv("QNN_SDK_ROOT")?.takeIf { it.isNotBlank() }
+val qnnEnabled = qnnSdkRoot != null
+
 android {
     namespace = "com.lantern.recorder"
     compileSdk = 35
@@ -15,6 +25,23 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
+
+        if (qnnEnabled) {
+            // QNN/HTP is arm64 only; the Hexagon-v79 skel + stubs ship in src/main/jniLibs.
+            ndk { abiFilters += "arm64-v8a" }
+            externalNativeBuild {
+                cmake { arguments += "-DQNN_SDK_ROOT=$qnnSdkRoot" }
+            }
+        }
+    }
+
+    if (qnnEnabled) {
+        externalNativeBuild {
+            cmake {
+                path = file("src/main/cpp/CMakeLists.txt")
+                version = "3.22.1"
+            }
+        }
     }
 
     buildTypes {

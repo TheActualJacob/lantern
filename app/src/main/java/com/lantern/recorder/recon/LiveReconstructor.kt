@@ -25,10 +25,19 @@ private const val TAG = "LANTERN"
  */
 class LiveReconstructor(
     da3ModelPath: String? = null,
+    qnnModelPath: String? = null,
 ) {
     private val volume = TsdfVolume()
     private val arcoreDepth = ArCoreRawDepthSource()
-    private val da3: Da3DepthModel? = da3ModelPath?.let { Da3DepthModel.loadOrNull(it) }
+
+    /**
+     * Dense-depth backend, picked once at construction. Preference order: native QNN DLC
+     * (Hexagon NPU) -> ExecuTorch `.pte` (CPU/NPU) -> none (ARCore-only). Each loader returns
+     * null when its model/runtime is absent, so this silently degrades on any device.
+     */
+    private val depth: DepthBackend? =
+        qnnModelPath?.let { QnnDlcDepthModel.loadOrNull(it) }
+            ?: da3ModelPath?.let { ExecuTorchDepthModel.loadOrNull(it) }
 
     private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "live-recon").apply { isDaemon = true } }
     private val busy = AtomicBoolean(false)
@@ -39,7 +48,8 @@ class LiveReconstructor(
     @Volatile private var integratedFrames = 0
     @Volatile private var running = false
 
-    val da3Active: Boolean get() = da3 != null
+    /** Which dense-depth runtime is live (for the UI readout); ARCORE when no model loaded. */
+    val depthBackend: DepthBackendKind get() = depth?.kind ?: DepthBackendKind.ARCORE
 
     fun start() {
         running = true
@@ -81,8 +91,8 @@ class LiveReconstructor(
         if (busy.get()) return // worker still chewing the previous keyframe; skip this one
 
         // Acquire metric depth now (Frame is only valid on this thread, this call).
-        val depth = arcoreDepth.acquire(frame) ?: return
-        val argb = if (da3 != null) {
+        val depthMap = arcoreDepth.acquire(frame) ?: return
+        val argb = if (depth != null) {
             try {
                 frame.acquireCameraImage().use { ImageUtils.yuvToArgb(it) }
             } catch (e: Exception) {
@@ -96,7 +106,7 @@ class LiveReconstructor(
         busy.set(true)
         worker.execute {
             try {
-                process(depth, argb, intrinsics, cameraToWorld)
+                process(depthMap, argb, intrinsics, cameraToWorld)
             } catch (t: Throwable) {
                 Log.e(TAG, "live recon worker failed", t)
             } finally {
@@ -115,8 +125,8 @@ class LiveReconstructor(
 
         // Prefer DA3 dense metric depth (scaled vs ARCore) when available.
         var fusionDepth = arcoreMetric
-        if (argb != null && da3 != null) {
-            val disp = da3.inferDisparity(argb)
+        if (argb != null && depth != null) {
+            val disp = depth.inferDisparity(argb)
             if (disp != null) {
                 val dense = AffineScaleSolver.buildMetricDepth(disp, arcoreMetric)
                 if (dense != null) fusionDepth = dense
@@ -181,7 +191,7 @@ class LiveReconstructor(
 
     fun close() {
         running = false
-        worker.execute { da3?.close() }
+        worker.execute { depth?.close() }
         worker.shutdown()
     }
 

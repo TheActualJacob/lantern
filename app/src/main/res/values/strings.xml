@@ -80,6 +80,7 @@
     <string name="mode_livemesh_cd">Live mesh mode: move the phone around the object and watch a 3D mesh build in real time</string>
     <!-- %1$d vertices, %2$d fused keyframes, %3$s depth backend (NPU/ARCore). -->
     <string name="livemesh_stats">%1$d verts · %2$d frames · %3$s</string>
+    <string name="livemesh_backend_qnn">QNN NPU</string>
     <string name="livemesh_backend_da3">DA3 NPU</string>
     <string name="livemesh_backend_arcore">ARCore depth</string>
     <string name="board_locked">Board locked — spin the object</string>

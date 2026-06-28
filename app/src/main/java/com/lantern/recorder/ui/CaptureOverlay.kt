@@ -70,6 +70,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.lantern.recorder.R
+import com.lantern.recorder.recon.DepthBackendKind
 import com.lantern.recorder.ui.theme.LanternNavy
 import com.lantern.recorder.ui.theme.RecordRed
 /**
@@ -156,7 +157,7 @@ fun CaptureOverlay(
             LiveMeshStatsChip(
                 vertices = state.liveMeshVertices,
                 frames = state.liveMeshFrames,
-                da3Active = state.liveMeshDa3Active,
+                depthBackend = state.liveMeshDepthBackend,
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
                     .windowInsetsPadding(WindowInsets.navigationBars)
@@ -723,11 +724,16 @@ private fun CaptureModeToggle(
 private fun LiveMeshStatsChip(
     vertices: Int,
     frames: Int,
-    da3Active: Boolean,
+    depthBackend: DepthBackendKind,
     modifier: Modifier = Modifier,
 ) {
+    val dense = depthBackend != DepthBackendKind.ARCORE
     val backend = stringResource(
-        if (da3Active) R.string.livemesh_backend_da3 else R.string.livemesh_backend_arcore
+        when (depthBackend) {
+            DepthBackendKind.QNN -> R.string.livemesh_backend_qnn
+            DepthBackendKind.EXECUTORCH -> R.string.livemesh_backend_da3
+            DepthBackendKind.ARCORE -> R.string.livemesh_backend_arcore
+        }
     )
     val label = stringResource(R.string.livemesh_stats, vertices, frames, backend)
     Surface(
@@ -748,7 +754,7 @@ private fun LiveMeshStatsChip(
                 Modifier
                     .size(9.dp)
                     .clip(CircleShape)
-                    .drawBehind { drawCircle(if (da3Active) Color(0xFF6BE675) else Color(0xFF8FC9FF)) },
+                    .drawBehind { drawCircle(if (dense) Color(0xFF6BE675) else Color(0xFF8FC9FF)) },
             )
             Text(
                 text = label,

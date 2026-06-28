@@ -4,6 +4,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import com.lantern.recorder.recon.DepthBackendKind
 import kotlin.math.atan2
 import kotlin.math.sqrt
 
@@ -195,15 +196,15 @@ class CaptureUiState {
     var liveMeshFrames by mutableIntStateOf(0)
         private set
 
-    /** Whether DA3 depth is running on-device (vs ARCore-only depth fallback). */
-    var liveMeshDa3Active by mutableStateOf(false)
+    /** Which dense-depth runtime is feeding the mesh (QNN NPU / ExecuTorch / ARCore-only). */
+    var liveMeshDepthBackend by mutableStateOf(DepthBackendKind.ARCORE)
         private set
 
     /** Updates the live-mesh readout (called on the UI thread from the GL loop). */
-    fun onLiveMeshStats(vertices: Int, frames: Int, da3Active: Boolean) {
+    fun onLiveMeshStats(vertices: Int, frames: Int, depthBackend: DepthBackendKind) {
         liveMeshVertices = vertices
         liveMeshFrames = frames
-        liveMeshDa3Active = da3Active
+        liveMeshDepthBackend = depthBackend
     }
 
     fun onDepthResolved(supported: Boolean) {
