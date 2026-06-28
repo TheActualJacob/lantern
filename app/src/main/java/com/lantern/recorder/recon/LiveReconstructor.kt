@@ -62,11 +62,25 @@ class LiveReconstructor(
     private var reanchorStreak = 0
 
     /**
-     * EMA of the masked object's median depth over *accepted* frames — the object's established
-     * distance. A frame whose mask depth jumps far from this is a transient FastSAM glitch (it
-     * grabbed the floor/background for a moment), and is rejected before it can bake into the TSDF.
+     * Object-lock lifecycle (segmentation mode only). The TSDF is permanent, so we never fuse on
+     * faith: SEARCHING warms up until FastSAM has held a single object steadily, then LOCKED fuses
+     * only frames consistent with that object. A transient floor grab is simply skipped; switching
+     * to a genuinely new object requires holding it steadily for [SWITCH_LOCK_MS].
      */
-    @Volatile private var objectDepthEma: Float? = null
+    private enum class LockState { SEARCHING, LOCKED }
+    @Volatile private var lockState = LockState.SEARCHING
+
+    // Warmup candidate (SEARCHING): the object distance we're waiting to confirm, and since when.
+    private var warmupDepth: Float? = null
+    private var warmupSinceNs = 0L
+
+    // The locked object's established distance (LOCKED), tracked as an EMA over consistent frames.
+    private var lockedDepth: Float? = null
+
+    // Switch candidate (LOCKED): a new object being considered, and how long it's been held steady.
+    private var switchDepth: Float? = null
+    private var switchCentroid: FloatArray? = null
+    private var switchSinceNs = 0L
 
     @Volatile var debugEnabled = false
     @Volatile private var latestDebugFrame: DebugFrame? = null
@@ -94,7 +108,13 @@ class LiveReconstructor(
             lastKeyframePos = null
             integratedFrames = 0
             reanchorStreak = 0
-            objectDepthEma = null
+            lockState = LockState.SEARCHING
+            warmupDepth = null
+            warmupSinceNs = 0L
+            lockedDepth = null
+            switchDepth = null
+            switchCentroid = null
+            switchSinceNs = 0L
             meshRef.set(MeshData.EMPTY)
             versionRef.set(versionRef.get() + 1)
         }
@@ -188,27 +208,13 @@ class LiveReconstructor(
         // ungated and stick in the volume. Only frames with an object mask contribute.
         if (seg != null && mask == null) return
 
-        // Reject bad-mask frames so transient garbage never bakes into the (permanent) TSDF.
-        // The TSDF never forgets: one floor-grab frame leaves floor in the mesh forever, so a
-        // momentary FastSAM jump to the floor/background must be caught *before* it fuses.
-        if (mask != null) {
-            val maskDepth = maskedMedianDepth(arcoreMetric, mask)
-            if (maskDepth != null) {
-                // (a) In-frame: the masked region disagrees with the centered object this frame.
-                if (focusDepth != null &&
-                    kotlin.math.abs(maskDepth - focusDepth) / focusDepth > MASK_DEPTH_TOL) {
-                    return
-                }
-                // (b) Temporal: the masked depth jumped away from the object's established distance.
-                // This catches a ~1 s floor grab even when the center reference is itself corrupted,
-                // and never updates the running distance on a rejected frame so a glitch can't creep
-                // in. A genuine approach/retreat moves only ~2 cm per keyframe, well within tolerance.
-                val ema = objectDepthEma
-                if (ema != null && kotlin.math.abs(maskDepth - ema) / ema > OBJECT_DEPTH_JUMP_TOL) {
-                    return
-                }
-                objectDepthEma = if (ema == null) maskDepth else ema + OBJECT_DEPTH_EMA_ALPHA * (maskDepth - ema)
-            }
+        // The object's metric distance (median depth over the mask) — the signal the lock tracks.
+        val maskDepth = if (mask != null) maskedMedianDepth(arcoreMetric, mask) else null
+
+        // In-frame sanity: the masked region must agree with the centered object this same frame.
+        if (mask != null && maskDepth != null && focusDepth != null &&
+            kotlin.math.abs(maskDepth - focusDepth) / focusDepth > MASK_DEPTH_TOL) {
+            return
         }
 
         // Prefer DA3 dense metric depth (scaled vs ARCore) when available.
@@ -223,38 +229,127 @@ class LiveReconstructor(
             }
         }
 
-        // What the camera is currently pointed at (object center in the world).
+        // What the camera is currently pointed at (object surface point in the world).
         val centroid = estimateCentroidWorld(fusionDepth, depthIntrinsics, cameraToWorld)
-        if (centroid != null) {
-            if (!volume.isCentered) {
-                volume.centerOn(centroid[0], centroid[1], centroid[2])
-                reanchorStreak = 0
-            } else if (isNewTarget(centroid)) {
-                // Pointed at a different object: re-lock there after a short debounce so a brief
-                // glance away doesn't wipe the scan, then clear the old mesh and rebuild fresh.
-                if (++reanchorStreak >= REANCHOR_FRAMES) {
-                    volume.reset()
-                    volume.centerOn(centroid[0], centroid[1], centroid[2])
-                    meshRef.set(MeshData.EMPTY)
-                    versionRef.set(versionRef.get() + 1)
-                    integratedFrames = 0
-                    reanchorStreak = 0
-                    objectDepthEma = null
+
+        // Without segmentation there's nothing to lock onto: keep the original behavior — center
+        // once on the look point, re-anchor only after a sustained move, and fuse every frame
+        // (the geometric ground/cylinder culls keep the floor out in this mode).
+        if (seg == null) {
+            if (centroid != null) {
+                if (!volume.isCentered) {
+                    volume.centerOn(centroid[0], centroid[1], centroid[2]); reanchorStreak = 0
+                } else if (isNewTarget(centroid)) {
+                    if (++reanchorStreak >= REANCHOR_FRAMES) {
+                        volume.reset(); volume.centerOn(centroid[0], centroid[1], centroid[2])
+                        meshRef.set(MeshData.EMPTY); versionRef.set(versionRef.get() + 1)
+                        integratedFrames = 0; reanchorStreak = 0
+                    }
+                } else reanchorStreak = 0
+            }
+            if (!volume.isCentered) return
+            fuse(fusionDepth, depthIntrinsics, cameraToWorld, mask)
+            return
+        }
+
+        // Segmentation mode: drive fusion through the object-lock state machine.
+        runLock(maskDepth, centroid, fusionDepth, depthIntrinsics, cameraToWorld, mask)
+    }
+
+    /**
+     * Object-lock state machine (segmentation mode). Decides whether this frame belongs to the
+     * locked object and fuses only if so — so a transient FastSAM floor grab never reaches the
+     * permanent TSDF, and a new object is only adopted after it's held steadily.
+     */
+    private fun runLock(
+        maskDepth: Float?,
+        centroid: FloatArray?,
+        fusionDepth: DepthMap,
+        depthIntrinsics: CameraIntrinsics,
+        cameraToWorld: FloatArray,
+        mask: FloatArray?,
+    ) {
+        val now = System.nanoTime()
+        when (lockState) {
+            LockState.SEARCHING -> {
+                // Warm up: require FastSAM to hold one object at a steady distance for
+                // WARMUP_LOCK_MS before committing. Nothing fuses here, so the mesh starts clean.
+                if (maskDepth == null || centroid == null) return
+                val cand = warmupDepth
+                if (cand == null || kotlin.math.abs(maskDepth - cand) / cand > LOCK_DEPTH_TOL) {
+                    warmupDepth = maskDepth
+                    warmupSinceNs = now
+                } else {
+                    warmupDepth = cand + LOCK_DEPTH_EMA_ALPHA * (maskDepth - cand)
+                    if (now - warmupSinceNs >= WARMUP_LOCK_MS * 1_000_000L) {
+                        volume.centerOn(centroid[0], centroid[1], centroid[2])
+                        lockedDepth = warmupDepth
+                        integratedFrames = 0
+                        switchDepth = null
+                        switchSinceNs = 0L
+                        lockState = LockState.LOCKED
+                    }
                 }
-            } else {
-                reanchorStreak = 0
+            }
+            LockState.LOCKED -> {
+                if (maskDepth == null || centroid == null) return // can't verify; skip this frame
+                val ld = lockedDepth
+                val depthOk = ld != null && kotlin.math.abs(maskDepth - ld) / ld <= LOCK_DEPTH_TOL
+                val posOk = !isNewTarget(centroid)
+                if (depthOk && posOk) {
+                    // On the locked object: track its drifting distance, drop any switch attempt, fuse.
+                    lockedDepth = ld!! + LOCK_DEPTH_EMA_ALPHA * (maskDepth - ld)
+                    switchDepth = null
+                    switchSinceNs = 0L
+                    fuse(fusionDepth, depthIntrinsics, cameraToWorld, mask)
+                } else {
+                    // Off the locked object (floor grab or a different place). Don't fuse. Adopt a
+                    // new object only after it's been held steadily for SWITCH_LOCK_MS — a brief
+                    // glitch never accumulates enough, while a deliberate new target does.
+                    val sc = switchDepth
+                    val scCentroid = switchCentroid
+                    val steady = sc != null &&
+                        kotlin.math.abs(maskDepth - sc) / sc <= LOCK_DEPTH_TOL &&
+                        scCentroid != null && dist2(centroid, scCentroid) <= LOCK_DIST_M * LOCK_DIST_M
+                    if (!steady) {
+                        switchDepth = maskDepth
+                        switchCentroid = centroid
+                        switchSinceNs = now
+                    } else if (now - switchSinceNs >= SWITCH_LOCK_MS * 1_000_000L) {
+                        volume.reset()
+                        volume.centerOn(centroid[0], centroid[1], centroid[2])
+                        meshRef.set(MeshData.EMPTY)
+                        versionRef.set(versionRef.get() + 1)
+                        lockedDepth = maskDepth
+                        integratedFrames = 0
+                        switchDepth = null
+                        switchSinceNs = 0L
+                    }
+                }
             }
         }
-        if (!volume.isCentered) return
+    }
 
+    /** Integrate one frame into the volume and re-mesh on the extract cadence. */
+    private fun fuse(
+        fusionDepth: DepthMap,
+        depthIntrinsics: CameraIntrinsics,
+        cameraToWorld: FloatArray,
+        mask: FloatArray?,
+    ) {
         volume.integrate(fusionDepth, depthIntrinsics, cameraToWorld, lastGroundPlaneY, mask)
         integratedFrames++
-
         if (integratedFrames % EXTRACT_EVERY == 0) {
             val mesh = volume.extractMesh()
             meshRef.set(mesh)
             versionRef.set(versionRef.get() + 1)
         }
+    }
+
+    /** Squared world distance between two points. */
+    private fun dist2(a: FloatArray, b: FloatArray): Float {
+        val dx = a[0] - b[0]; val dy = a[1] - b[1]; val dz = a[2] - b[2]
+        return dx * dx + dy * dy + dz * dz
     }
 
     /** True if [centroid] is far enough from the current volume center to be a different object. */
@@ -301,6 +396,7 @@ class LiveReconstructor(
             append("objFound=${mask != null}  maskCov=${"%.1f".format(coverage * 100)}%\n")
             append("focusDepth=${focusDepth?.let { "%.2fm".format(it) } ?: "—"}  ")
             append("ground=${lastGroundPlaneY?.let { "%.2f".format(it) } ?: "—"}\n")
+            append("lock=$lockState  lockDepth=${lockedDepth?.let { "%.2fm".format(it) } ?: "—"}\n")
             append("centered=${volume.isCentered}  frames=$integratedFrames\n")
             append("depth=${w}x$h  argb=${argb.width}x${argb.height}")
         }
@@ -391,11 +487,20 @@ class LiveReconstructor(
         // more than this fraction — i.e. the mask grabbed the floor/background, not the object.
         private const val MASK_DEPTH_TOL = 0.25f
 
-        // Temporal glitch gate: reject a frame whose masked depth jumps more than this fraction
-        // from the object's established (EMA) distance. Handheld motion moves the object only ~2 cm
-        // per keyframe, so a real scan stays well under this; a floor grab spikes far past it.
-        private const val OBJECT_DEPTH_JUMP_TOL = 0.30f
-        // EMA smoothing for the established object distance (higher = tracks faster, forgives less).
-        private const val OBJECT_DEPTH_EMA_ALPHA = 0.2f
+        // Object-lock state machine (segmentation mode):
+        // Warmup: FastSAM must hold one object at a steady distance this long before anything fuses.
+        private const val WARMUP_LOCK_MS = 5_000L
+        // Switch: a new object must be held steadily this long before it replaces the locked one,
+        // so a ~1 s floor grab can never re-lock or leak into the mesh.
+        private const val SWITCH_LOCK_MS = 4_000L
+        // A frame is "on the locked object" when its mask depth is within this fraction of the
+        // locked distance. Keyframes are gated to 2 cm of motion, so a real object drifts only a
+        // few percent per frame, while a mask jump to the floor spikes far past this.
+        private const val LOCK_DEPTH_TOL = 0.18f
+        // EMA smoothing for the locked/warmup distance (higher tracks deliberate motion faster).
+        private const val LOCK_DEPTH_EMA_ALPHA = 0.2f
+        // World-space window (m) within which a switch candidate's look point must stay to count as
+        // the same steady new object; a jittering floor grab never holds still inside it.
+        private const val LOCK_DIST_M = 0.30f
     }
 }
